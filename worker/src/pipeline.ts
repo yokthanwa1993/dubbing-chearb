@@ -1,0 +1,501 @@
+/**
+ * Dubbing Pipeline — 100% Cloudflare Native
+ * ffmpeg merge รันใน Cloudflare Container
+ */
+
+export type Env = {
+    DB: D1Database
+    BUCKET: R2Bucket
+    MERGE_CONTAINER: DurableObjectNamespace
+    GOOGLE_API_KEY: string
+    TELEGRAM_BOT_TOKEN: string
+    R2_PUBLIC_URL: string
+    R2_ACCOUNT_ID: string
+    R2_ACCESS_KEY_ID: string
+    R2_SECRET_ACCESS_KEY: string
+    GEMINI_MODEL: string
+    CORS_ORIGIN: string
+}
+
+// ==================== Telegram Helpers ====================
+
+export async function sendTelegram(token: string, method: string, body: Record<string, unknown>) {
+    const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    })
+    return resp.json() as Promise<{ ok: boolean; result?: Record<string, unknown> }>
+}
+
+type StepName = 'วิดีโอ' | 'วิเคราะห์' | 'เสียง' | 'รวม' | 'เสร็จ'
+
+const STEP_ICONS: Record<StepName, string> = {
+    'วิดีโอ': '📥',
+    'วิเคราะห์': '🔍',
+    'เสียง': '🎙️',
+    'รวม': '🎬',
+    'เสร็จ': '✅',
+}
+
+const STEP_DONE_TEXT: Record<StepName, string> = {
+    'วิดีโอ': 'ดาวน์โหลดวิดีโอ',
+    'วิเคราะห์': 'วิเคราะห์วิดีโอ',
+    'เสียง': 'สร้างเสียงพากย์',
+    'รวม': 'รวมวิดีโอ',
+    'เสร็จ': 'เสร็จสิ้น',
+}
+
+const STEP_PROGRESS_TEXT: Record<StepName, string> = {
+    'วิดีโอ': 'กำลังดาวน์โหลดวิดีโอ',
+    'วิเคราะห์': 'กำลังวิเคราะห์วิดีโอ',
+    'เสียง': 'กำลังสร้างเสียงพากย์',
+    'รวม': 'กำลังรวมวิดีโอ',
+    'เสร็จ': 'เสร็จสิ้น',
+}
+
+const DOT_FRAMES = ['', '.', '..', '...']
+
+function buildStatusText(completedSteps: StepName[], currentStep?: StepName, dotIndex?: number): string {
+    const lines: string[] = []
+    for (const step of completedSteps) {
+        lines.push(`${STEP_ICONS[step]} ${STEP_DONE_TEXT[step]} ✅`)
+    }
+    if (currentStep) {
+        const dots = dotIndex !== undefined ? DOT_FRAMES[dotIndex % 4] : '...'
+        lines.push(`${STEP_ICONS[currentStep]} ${STEP_PROGRESS_TEXT[currentStep]}${dots}`)
+    }
+    return lines.join('\n') || '⏳ เริ่มต้น...'
+}
+
+/** เริ่ม animation จุดวิ่ง — return ฟังก์ชัน stop() */
+/** เริ่ม animation จุดวิ่ง — return ฟังก์ชัน stop() ที่ต้อง await */
+function startDotAnimation(
+    token: string,
+    chatId: number,
+    msgId: number,
+    completedSteps: StepName[],
+    currentStep: StepName,
+): { stop: () => Promise<void> } {
+    let running = true
+    let dotIndex = 0
+    let loopPromise: Promise<void> | null = null
+
+    const loop = async () => {
+        while (running) {
+            const text = buildStatusText(completedSteps, currentStep, dotIndex)
+            await sendTelegram(token, 'editMessageText', {
+                chat_id: chatId,
+                message_id: msgId,
+                text,
+                parse_mode: 'HTML',
+            }).catch(() => { })
+
+            dotIndex++
+            if (running) {
+                await new Promise(r => setTimeout(r, 800)) // ช้าลงหน่อย ลด load
+            }
+        }
+    }
+
+    loopPromise = loop()
+
+    return {
+        stop: async () => {
+            running = false
+            if (loopPromise) await loopPromise
+        }
+    }
+}
+
+// ==================== XHS Download ====================
+
+async function resolveXhsVideo(url: string, env: Env): Promise<string | null> {
+    // เรียก Container เพื่อ resolve XHS URL
+    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+
+    const resp = await containerStub.fetch('http://container/xhs/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+    })
+
+    if (!resp.ok) return null
+
+    const data = await resp.json() as { video_url?: string }
+    return data?.video_url || null
+}
+
+async function downloadVideo(videoUrl: string): Promise<ArrayBuffer> {
+    const resp = await fetch(videoUrl, {
+        headers: { 'Referer': 'https://www.xiaohongshu.com/' },
+    })
+    if (!resp.ok) throw new Error(`ดาวน์โหลดวิดีโอไม่ได้: ${resp.status}`)
+    return resp.arrayBuffer()
+}
+
+// ==================== Gemini API ====================
+
+async function uploadToGemini(videoBytes: ArrayBuffer, apiKey: string): Promise<{ fileUri: string; fileName: string }> {
+    // Step 1: เริ่ม resumable upload
+    const initResp = await fetch(
+        `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
+        {
+            method: 'POST',
+            headers: {
+                'X-Goog-Upload-Protocol': 'resumable',
+                'X-Goog-Upload-Command': 'start',
+                'X-Goog-Upload-Header-Content-Length': String(videoBytes.byteLength),
+                'X-Goog-Upload-Header-Content-Type': 'video/mp4',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ file: { display_name: 'video.mp4' } }),
+        }
+    )
+
+    const uploadUrl = initResp.headers.get('X-Goog-Upload-URL')
+    if (!uploadUrl) throw new Error('ไม่ได้ upload URL จาก Gemini')
+
+    // Step 2: อัพโหลดวิดีโอ
+    const uploadResp = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+            'X-Goog-Upload-Command': 'upload, finalize',
+            'X-Goog-Upload-Offset': '0',
+            'Content-Type': 'video/mp4',
+        },
+        body: videoBytes,
+    })
+
+    const result = await uploadResp.json() as {
+        file?: { uri?: string; name?: string }
+    }
+    const fileUri = result?.file?.uri
+    const fileName = result?.file?.name
+    if (!fileUri || !fileName) throw new Error('อัพโหลดไป Gemini ไม่สำเร็จ')
+
+    return { fileUri, fileName }
+}
+
+async function waitForProcessing(fileName: string, apiKey: string): Promise<string> {
+    // รอ Gemini ประมวลผลวิดีโอ (poll ทุก 2 วินาที สูงสุด 30 รอบ)
+    for (let i = 0; i < 30; i++) {
+        const resp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`
+        )
+        const data = await resp.json() as { state?: string; uri?: string }
+        if (data.state !== 'PROCESSING') {
+            return data.uri || ''
+        }
+        await new Promise(r => setTimeout(r, 2000))
+    }
+    throw new Error('Gemini ประมวลผลวิดีโอนานเกินไป')
+}
+
+async function generateScript(
+    fileUri: string,
+    duration: number,
+    apiKey: string,
+    model: string,
+): Promise<{ script: string; title: string; category: string }> {
+    const targetChars = Math.floor(duration * 10)
+    const minChars = Math.floor(duration * 8)
+
+    const categories = ['เครื่องมือช่าง', 'อาหาร', 'เครื่องครัว', 'ของใช้ในบ้าน', 'เฟอร์นิเจอร์', 'บิวตี้', 'แฟชั่น', 'อิเล็กทรอนิกส์', 'สุขภาพ', 'กีฬา', 'สัตว์เลี้ยง', 'ยานยนต์', 'อื่นๆ']
+
+    const prompt = `คุณคือ "พี่ต้น" นักรีวิวสินค้าออนไลน์มือฉมัง ที่มีผู้ติดตามหลายล้านคน
+
+ดูวิดีโอสินค้านี้แล้วเขียน script พากย์เสียงภาษาไทย + แคปชั่นสั้น + เลือกหมวดหมู่
+
+⚠️ สำคัญมาก: วิดีโอยาว ${Math.round(duration)} วินาที
+- Script ต้องยาว ${minChars}-${targetChars} ตัวอักษร (ภาษาไทยพูดประมาณ 8-10 ตัว/วินาที)
+- ถ้า script สั้นกว่านี้ วิดีโอจะถูกตัด!
+
+สไตล์:
+- เปิดด้วย "โห้ อันนี้ต้องมี!" หรือ "ของดีมาแล้วครับพี่น้อง!"
+- บรรยายจุดเด่นของสินค้าตามที่เห็นในวิดีโอ อธิบายให้ละเอียด
+- ใส่ประโยชน์การใช้งาน วิธีใช้ ข้อดี
+- ปิดด้วย "สนใจสั่งเลยครับ รีบๆนะ ของมีจำกัด!"
+
+หมวดหมู่ที่เลือกได้: ${categories.join(', ')}
+
+ตอบเป็น JSON:
+{
+  "thai_script": "ข้อความพากย์เสียงยาว ${minChars}-${targetChars} ตัวอักษร",
+  "title": "แคปชั่นสั้นๆ ดึงดูด 1 บรรทัด",
+  "category": "เลือกจากรายการหมวดหมู่ข้างบน"
+}`
+
+    const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{
+                    parts: [
+                        { fileData: { mimeType: 'video/mp4', fileUri } },
+                        { text: prompt },
+                    ]
+                }],
+                generationConfig: { temperature: 0.8, maxOutputTokens: 4096 },
+            }),
+        }
+    )
+
+    const result = await resp.json() as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+        error?: { message?: string; code?: number }
+    }
+
+    // Log raw response เพื่อ debug
+    if (result?.error) {
+        console.error(`[GEMINI] API error: ${result.error.code} - ${result.error.message}`)
+        throw new Error(`Gemini API error: ${result.error.message}`)
+    }
+
+    let scriptText = result?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+    console.log(`[GEMINI] Raw response length: ${scriptText.length}, preview: ${scriptText.slice(0, 100)}`)
+    scriptText = scriptText.replace(/```json/g, '').replace(/```/g, '').trim()
+
+    try {
+        const parsed = JSON.parse(scriptText)
+        const cat = categories.includes(parsed.category) ? parsed.category : 'อื่นๆ'
+        return { script: parsed.thai_script || '', title: parsed.title || '', category: cat }
+    } catch {
+        // fallback: regex
+        const scriptMatch = scriptText.match(/"thai_script":\s*"([^"]+)"/)
+        const titleMatch = scriptText.match(/"title":\s*"([^"]+)"/)
+        const catMatch = scriptText.match(/"category":\s*"([^"]+)"/)
+        const script = scriptMatch ? scriptMatch[1] : scriptText.slice(0, 500)
+        console.log(`[GEMINI] Fallback script length: ${script.length}`)
+        return {
+            script,
+            title: titleMatch ? titleMatch[1] : '',
+            category: catMatch && categories.includes(catMatch[1]) ? catMatch[1] : 'อื่นๆ',
+        }
+    }
+}
+
+async function generateTTS(script: string, apiKey: string): Promise<string> {
+    const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: script }] }],
+                generationConfig: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } },
+                    },
+                },
+            }),
+        }
+    )
+
+    if (!resp.ok) {
+        const err = await resp.json() as { error?: { message?: string } }
+        throw new Error(`TTS ล้มเหลว: ${err?.error?.message || resp.status}`)
+    }
+
+    const result = await resp.json() as {
+        candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string } }> } }>
+    }
+
+    const audioBase64 = result?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data
+    if (!audioBase64) throw new Error('ไม่ได้เสียงจาก TTS')
+    return audioBase64
+}
+
+// ==================== Container Merge ====================
+
+async function callContainerMerge(
+    env: Env,
+    videoUrl: string,
+    audioBase64: string,
+): Promise<{ video_base64: string; thumb_base64?: string; duration: number }> {
+    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+
+    const MAX_RETRIES = 5
+    const BASE_DELAY_MS = 5000 // 5 seconds
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const resp = await containerStub.fetch('http://container/merge', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    video_url: videoUrl,
+                    audio_base64: audioBase64,
+                    sample_rate: 24000,
+                }),
+            })
+
+            if (!resp.ok) {
+                const err = await resp.json() as { error?: string }
+                throw new Error(`Container merge ล้มเหลว: ${err?.error || resp.status}`)
+            }
+
+            return resp.json() as Promise<{ video_base64: string; thumb_base64?: string; duration: number }>
+        } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error)
+            const isRetryable = errMsg.includes('disconnected') || errMsg.includes('reset') || errMsg.includes('connect') || errMsg.includes('fetch failed') || errMsg.includes('network')
+
+            if (isRetryable && attempt < MAX_RETRIES) {
+                const delay = BASE_DELAY_MS * attempt // 5s, 10s, 15s, 20s, 25s
+                console.log(`[CONTAINER] Attempt ${attempt}/${MAX_RETRIES} failed (${errMsg}), retrying in ${delay / 1000}s...`)
+                await new Promise(resolve => setTimeout(resolve, delay))
+            } else {
+                throw error
+            }
+        }
+    }
+
+    throw new Error('Container merge: max retries exceeded')
+}
+
+// ==================== Gallery Cache ====================
+
+/** Rebuild _cache/gallery.json — อ่าน .json ทั้งหมดแล้วรวมเป็นไฟล์เดียว */
+export async function rebuildGalleryCache(bucket: R2Bucket): Promise<unknown[]> {
+    const list = await bucket.list({ prefix: 'videos/' })
+    const videos: unknown[] = []
+
+    for (const obj of list.objects) {
+        if (!obj.key.endsWith('.json')) continue
+        const metaObj = await bucket.get(obj.key)
+        if (!metaObj) continue
+        videos.push(await metaObj.json())
+    }
+
+    videos.sort((a: any, b: any) =>
+        (b.createdAt || '').localeCompare(a.createdAt || '')
+    )
+
+    await bucket.put('_cache/gallery.json', JSON.stringify({ videos }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+
+    return videos
+}
+
+/** Incremental update — อ่าน cache เดิม แล้ว upsert เฉพาะ 1 video */
+export async function updateGalleryCache(bucket: R2Bucket, videoId: string): Promise<void> {
+    // อ่าน metadata ของ video ที่เปลี่ยน
+    const metaObj = await bucket.get(`videos/${videoId}.json`)
+    if (!metaObj) return
+
+    const updatedVideo = await metaObj.json() as Record<string, unknown>
+
+    // อ่าน cache เดิม
+    let videos: Record<string, unknown>[] = []
+    const cacheObj = await bucket.get('_cache/gallery.json')
+    if (cacheObj) {
+        const cache = await cacheObj.json() as { videos: Record<string, unknown>[] }
+        videos = cache.videos || []
+    }
+
+    // Upsert: แทนที่ตัวเดิม หรือเพิ่มใหม่
+    const idx = videos.findIndex(v => v.id === videoId)
+    if (idx >= 0) {
+        videos[idx] = updatedVideo
+    } else {
+        videos.unshift(updatedVideo) // เพิ่มใหม่ที่หัว (ล่าสุด)
+    }
+
+    // Sort by createdAt desc
+    videos.sort((a, b) =>
+        ((b.createdAt as string) || '').localeCompare((a.createdAt as string) || '')
+    )
+
+    await bucket.put('_cache/gallery.json', JSON.stringify({ videos }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
+// ==================== Main Pipeline ====================
+
+export async function runPipeline(
+    env: Env,
+    videoUrl: string,
+    chatId: number,
+    statusMsgId: number,
+) {
+    const token = env.TELEGRAM_BOT_TOKEN
+    const apiKey = env.GOOGLE_API_KEY
+    const model = env.GEMINI_MODEL || 'gemini-2.0-flash'
+
+    try {
+        // ถ้าเป็น XHS link → resolve URL จริงก่อน (เร็ว ~1-2 วินาที)
+        let directVideoUrl = videoUrl
+        if (videoUrl.includes('xhs') || videoUrl.includes('xiaohongshu')) {
+            const resolved = await resolveXhsVideo(videoUrl, env)
+            if (!resolved) throw new Error('ไม่พบวิดีโอใน XHS link นี้')
+            directVideoUrl = resolved
+        }
+
+        // ส่งงานทั้งหมดไป Container /pipeline — รัน background ไม่มี time limit
+        const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+        const containerStub = env.MERGE_CONTAINER.get(containerId)
+
+        const payload = JSON.stringify({
+            token,
+            video_url: directVideoUrl,
+            chat_id: chatId,
+            msg_id: statusMsgId,
+            api_key: apiKey,
+            model,
+            r2_public_url: env.R2_PUBLIC_URL,
+            worker_url: 'https://dubbing-chearb-worker.yokthanwa1993-bc9.workers.dev',
+        })
+
+        // Health check ก่อน — รอ Container boot สูงสุด 3 ครั้ง × 3 วินาที = 9 วินาที
+        let containerReady = false
+        for (let i = 0; i < 3; i++) {
+            try {
+                const hResp = await containerStub.fetch('http://container/health')
+                const hText = await hResp.text()
+                if (!hText.startsWith('<') && hResp.ok) {
+                    containerReady = true
+                    break
+                }
+            } catch { /* Container ยัง boot */ }
+            await new Promise(r => setTimeout(r, 3000))
+        }
+
+        if (!containerReady) {
+            throw new Error('⏳ Container กำลัง boot ใหม่ กรุณาลองส่งลิงก์อีกครั้งใน 30 วินาที')
+        }
+
+        // Dispatch pipeline
+        const resp = await containerStub.fetch('http://container/pipeline', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload,
+        })
+
+        const body = await resp.text()
+        if (body.startsWith('<') || !resp.ok) {
+            throw new Error(`Container pipeline error ${resp.status}: ${body.slice(0, 100)}`)
+        }
+
+        console.log(`[PIPELINE] Dispatched to container for chat_id=${chatId}`)
+
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error)
+        console.error(`[PIPELINE] ผิดพลาด: ${errMsg}`)
+
+        await sendTelegram(token, 'editMessageText', {
+            chat_id: chatId,
+            message_id: statusMsgId,
+            text: `❌ ผิดพลาด\n\n${errMsg.slice(0, 150)}`,
+            parse_mode: 'HTML',
+        }).catch(() => { })
+    }
+}
+
+

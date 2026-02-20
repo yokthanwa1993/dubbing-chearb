@@ -1,0 +1,66 @@
+{
+    "name": "dubbing-chearb-worker",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-02-14",
+    // Pipeline ใช้เวลา 2-3 นาที
+    "limits": {
+        "cpu_ms": 300000
+    },
+    // Container: FFmpeg merge service
+    "containers": [
+        {
+            "class_name": "MergeContainer",
+            "image": "../merge/Dockerfile",
+            "instance_type": "basic",
+            "max_instances": 2
+        }
+    ],
+    // Durable Objects (Container = DO)
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "MERGE_CONTAINER",
+                "class_name": "MergeContainer"
+            }
+        ]
+    },
+    // DO migrations
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": [
+                "MergeContainer"
+            ]
+        }
+    ],
+    // D1 Database — ใช้ DB ใหม่แยกจาก dubbing เดิม
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "dubbing-chearb-db",
+            "database_id": "02bf7a49-6ef2-4a53-b75e-e8a5962295ab"
+        }
+    ],
+    // R2 Bucket — ใช้ bucket ใหม่แยกจาก dubbing เดิม
+    "r2_buckets": [
+        {
+            "binding": "BUCKET",
+            "bucket_name": "dubbing-chearb-videos"
+        }
+    ],
+    // Environment variables
+    "vars": {
+        "CORS_ORIGIN": "*",
+        "R2_PUBLIC_URL": "https://pub-1b94ef9da5c447c3b4c080893c2f6613.r2.dev",
+        "GEMINI_MODEL": "gemini-3-flash-preview"
+    },
+    // Secrets (set via `wrangler secret put`):
+    // GOOGLE_API_KEY
+    // TELEGRAM_BOT_TOKEN
+    // Cron trigger for auto-posting to Facebook Reels
+    "triggers": {
+        "crons": [
+            "* * * * *"
+        ]
+    }
+}
