@@ -1,14 +1,20 @@
 FROM python:3.11-slim
 
-# ffmpeg สำหรับ merge video+audio
+# ffmpeg + imagemagick สำหรับ merge video+audio+subtitles
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
+    ffmpeg imagemagick wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Fix ImageMagick policy
+COPY policy.xml /etc/ImageMagick-6/policy.xml
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy font
+COPY font.ttf .
 
 COPY server.py .
 

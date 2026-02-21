@@ -85,16 +85,17 @@ const VideoIconFilled = () => (
     <path d="M4 6a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 14l5.293 2.646A1 1 0 0021 15.75V8.25a1 1 0 00-1.707-.896L14 10v4z" />
   </svg>
 )
-const UsedIcon = () => (
+const ProcessIcon = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" strokeLinecap="round" strokeLinejoin="round" />
+    <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
   </svg>
 )
-const UsedIconFilled = () => (
+const ProcessIconFilled = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+    <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l1.903 1.903h-3.183a.75.75 0 100 1.5h4.992a.75.75 0 00.75-.75V4.356a.75.75 0 00-1.5 0v3.18l-1.9-1.9A9 9 0 003.306 9.67a.75.75 0 101.45.388zm15.408 3.352a.75.75 0 00-.919.53 7.5 7.5 0 01-12.548 3.364l-1.902-1.903h3.183a.75.75 0 000-1.5H2.984a.75.75 0 00-.75.75v4.992a.75.75 0 001.5 0v-3.18l1.9 1.9a9 9 0 0015.059-4.035.75.75 0 00-.53-.918z" clipRule="evenodd" />
   </svg>
 )
+
 const ListIcon = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
     <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round" strokeLinejoin="round" />
@@ -424,13 +425,14 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
     >
       <Thumb id={video.id} url={video.thumbnailUrl} fallback={video.publicUrl} />
       {video.shopeeLink && (
-        <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
+        <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" />
             <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </div>
       )}
+
       <div className="absolute bottom-2 right-2 bg-black/60 backdrop-blur-md text-white text-[10px] px-2 py-0.5 rounded-full font-medium">
         {formatDuration(video.duration)}
       </div>
@@ -773,6 +775,7 @@ function App() {
     _setUsedVideos(v)
     try { localStorage.setItem('used_cache', JSON.stringify(v)) } catch { }
   }
+  const [processingVideos, setProcessingVideos] = useState<Video[]>([])
   const [loading, setLoading] = useState(() => {
     try { return !localStorage.getItem('gallery_cache') } catch { return true }
   })
@@ -783,7 +786,8 @@ function App() {
     return thaiTime.toISOString().split('T')[0]
   }
 
-  const [categoryFilter, setCategoryFilter] = useState<string>('all')
+
+  const [categoryFilter, setCategoryFilter] = useState<string>('unused')
   const [logDateFilter, setLogDateFilter] = useState<string>(getTodayString())
   const [categories, _setCategories] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('categories_cache') || '[]') } catch { return [] }
@@ -795,16 +799,16 @@ function App() {
   const [newCat, setNewCat] = useState('')
 
   // Read initial tab from URL param
-  const getInitialTab = (): 'home' | 'gallery' | 'used' | 'logs' | 'pages' | 'settings' => {
+  const getInitialTab = (): 'home' | 'processing' | 'gallery' | 'logs' | 'pages' | 'settings' => {
     const params = new URLSearchParams(window.location.search)
     const tabParam = params.get('tab')
-    if (tabParam === 'gallery' || tabParam === 'used' || tabParam === 'logs' || tabParam === 'pages' || tabParam === 'settings') {
-      return tabParam
+    if (tabParam === 'processing' || tabParam === 'gallery' || tabParam === 'logs' || tabParam === 'pages' || tabParam === 'settings') {
+      return tabParam as 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'
     }
     return 'home'
   }
 
-  const [tab, setTab] = useState<'home' | 'gallery' | 'used' | 'logs' | 'pages' | 'settings'>(getInitialTab())
+  const [tab, setTab] = useState<'home' | 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'>(getInitialTab())
   const [pages, setPages] = useState<FacebookPage[]>([])
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
@@ -865,6 +869,16 @@ function App() {
           const data = await usedResp.json()
           setUsedVideos(data.videos || [])
         }
+      } catch { }
+
+      try {
+        const [procResp, queueResp] = await Promise.all([
+          fetch(`${WORKER_URL}/api/processing`),
+          fetch(`${WORKER_URL}/api/queue`),
+        ])
+        const procData = procResp.ok ? await procResp.json() : { videos: [] }
+        const queueData = queueResp.ok ? await queueResp.json() : { queue: [] }
+        setProcessingVideos([...(procData.videos || []), ...(queueData.queue || [])])
       } catch { }
     } catch {
       // ignore
@@ -932,6 +946,13 @@ function App() {
     }
   }
 
+  const handleDeleteProcessing = async (id: string) => {
+    try {
+      await fetch(`${WORKER_URL}/api/processing/${id}`, { method: 'DELETE' })
+      setProcessingVideos(prev => prev.filter(v => v.id !== id))
+    } catch { }
+  }
+
   // If viewing a specific page detail
   if (selectedPage) {
     return (
@@ -960,44 +981,35 @@ function App() {
       {/* Top Nav — fixed */}
       <div className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-30 pt-[52px] px-5">
         <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
-          {tab === 'home' ? 'Dashboard' : tab === 'gallery' ? 'Gallery' : tab === 'used' ? 'Used Videos' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
+          {tab === 'home' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
         </h1>
-        {(tab === 'gallery' || tab === 'used') && (() => {
+        {tab === 'gallery' && (() => {
           const usedIds = new Set(usedVideos.map(v => v.id))
-          const videosToShow = tab === 'gallery' ? videos.filter(v => !usedIds.has(v.id)) : usedVideos
+          const videosToShow = [...videos.filter(v => !usedIds.has(v.id)), ...usedVideos]
           if (videosToShow.length === 0) return null
-          const hasUncategorized = videosToShow.some((v: Video) => !v.category)
-          const items: { key: string; label: string }[] = [
-            { key: 'all', label: 'ทั้งหมด' },
-            ...categories.map(cat => ({ key: cat, label: cat })),
-            ...(hasUncategorized ? [{ key: 'none', label: 'ไม่มีหมวดหมู่' }] : []),
-          ]
+          const unUsedCount = videos.filter((v: Video) => !usedIds.has(v.id)).length
+          const usedCount = usedVideos.length
           return (
-            <div className="flex overflow-x-auto [&::-webkit-scrollbar]:hidden -mx-5 px-5 gap-6">
-              {items.map(item => (
-                <button
-                  key={item.key}
-                  onClick={() => setCategoryFilter(item.key)}
-                  className="shrink-0 relative pb-2.5"
-                >
-                  <span className={`text-[15px] transition-all ${categoryFilter === item.key ? 'font-bold text-gray-900' : 'font-medium text-gray-400'}`}>
-                    {item.label}
-                    <span className="text-[11px] ml-0.5 opacity-60">
-                      ({item.key === 'all' ? videosToShow.length : item.key === 'none' ? videosToShow.filter((v: Video) => !v.category).length : videosToShow.filter((v: Video) => v.category?.split(',').includes(item.key)).length})
-                    </span>
-                  </span>
-                  {categoryFilter === item.key && (
-                    <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-6 h-[3px] bg-gray-900 rounded-full" />
-                  )}
-                </button>
-              ))}
+            <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl">
+              <button
+                onClick={() => setCategoryFilter('unused')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ยังไม่ใช้ ({unUsedCount})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('used')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ใช้แล้ว ({usedCount})
+              </button>
             </div>
           )
         })()}
       </div>
 
       {/* Main Content */}
-      <div className={`flex-1 ${(tab === 'gallery' || tab === 'used') && (() => { const ids = new Set(usedVideos.map(v => v.id)); return (tab === 'gallery' ? videos.filter(v => !ids.has(v.id)) : usedVideos).length > 0 })() ? 'pt-[140px]' : 'pt-[104px]'} pb-24 [&::-webkit-scrollbar]:hidden ${tab === 'home' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+      <div className={`flex-1 ${tab === 'gallery' && (() => { const ids = new Set(usedVideos.map(v => v.id)); return [...videos.filter(v => !ids.has(v.id)), ...usedVideos].length > 0 })() ? 'pt-[164px]' : 'pt-[104px]'} pb-24 [&::-webkit-scrollbar]:hidden ${tab === 'home' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
 
         {tab === 'home' && (
           <div className="px-5 h-full flex flex-col">
@@ -1049,15 +1061,85 @@ function App() {
           </div>
         )}
 
-        {(tab === 'gallery' || tab === 'used') && (() => {
-          // Gallery: exclude used videos, Used: show only used videos
+        {tab === 'processing' && (
+          <div className="px-4">
+            {processingVideos.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-[50vh]">
+                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                  <span className="text-4xl grayscale opacity-50">⚙️</span>
+                </div>
+                <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
+                <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {processingVideos.map((video: any) => (
+                  <div key={video.id} className="flex gap-3 bg-white border border-gray-100 rounded-2xl p-3 shadow-sm relative">
+                    {video.status === 'failed' && (
+                      <button
+                        onClick={() => handleDeleteProcessing(video.id)}
+                        className="absolute top-2 right-2 p-1.5 bg-red-50 text-red-500 rounded-full hover:bg-red-100 transition-colors"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+                      </button>
+                    )}
+                    {/* Placeholder for processing video thumbnail */}
+                    <div className={`w-24 h-32 rounded-xl flex flex-col items-center justify-center shrink-0 relative overflow-hidden ${video.status === 'failed' ? 'bg-red-50' : video.status === 'queued' ? 'bg-amber-50' : 'bg-gray-100'}`}>
+                      <div className={`absolute inset-0 bg-gradient-to-tr ${video.status === 'failed' ? 'from-red-200 to-red-50' : video.status === 'queued' ? 'from-amber-100 to-amber-50' : 'from-blue-100 to-gray-50'} opacity-50`}></div>
+                      {video.status === 'failed' ? (
+                        <span className="text-2xl relative z-10">❌</span>
+                      ) : video.status === 'queued' ? (
+                        <span className="text-2xl relative z-10">⏳</span>
+                      ) : (
+                        <>
+                          <div className="w-8 h-8 rounded-full border-2 border-blue-500 border-t-transparent animate-spin z-10" />
+                          {video.step && <p className="text-[10px] text-blue-600 font-bold mt-1.5 z-10">{video.step}/5</p>}
+                        </>
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0 py-1 flex flex-col pr-6">
+                      <div className="flex justify-between items-start gap-2">
+                        <p className="font-bold text-gray-900 text-sm line-clamp-2">ID: {video.id}</p>
+                      </div>
+                      <div className="mt-1">
+                        {video.status === 'failed' ? (
+                          <span className="text-[10px] bg-red-50 text-red-600 px-2 py-0.5 rounded-md font-bold shrink-0">ล้มเหลว</span>
+                        ) : video.status === 'queued' ? (
+                          <span className="text-[10px] bg-amber-50 text-amber-600 px-2 py-0.5 rounded-md font-bold shrink-0">⏳ รอคิว</span>
+                        ) : (
+                          <span className="text-[10px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded-md font-bold shrink-0">{video.stepName || 'กำลังประมวลผล'}</span>
+                        )}
+                      </div>
+                      {/* Step progress bar */}
+                      {video.status !== 'failed' && video.step && (
+                        <div className="mt-1.5 w-full bg-gray-200 rounded-full h-1.5">
+                          <div className="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${(video.step / 5) * 100}%` }} />
+                        </div>
+                      )}
+                      <div className="mt-auto space-y-1.5">
+                        {video.status === 'failed' && video.error && (
+                          <p className="text-[10px] text-red-500 font-medium truncate" title={video.error}>{video.error}</p>
+                        )}
+                        <p className="text-[10px] text-gray-500 flex items-center gap-1.5 truncate">
+                          <span className="w-4 h-4 rounded-full bg-gray-100 flex items-center justify-center shrink-0"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
+                          {video.shopeeLink || 'ไม่มีลิงก์ Shopee'}
+                        </p>
+                        <p className="text-[10px] text-gray-400 font-medium">เริ่มเมื่อ: {new Date(video.createdAt).toLocaleTimeString('th-TH')}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'gallery' && (() => {
           const usedIds = new Set(usedVideos.map(v => v.id))
-          const availableVideos = tab === 'gallery'
-            ? videos.filter((v: Video) => !usedIds.has(v.id))
-            : usedVideos
-          const filtered = categoryFilter === 'all' ? availableVideos
-            : categoryFilter === 'none' ? availableVideos.filter((v: Video) => !v.category)
-              : availableVideos.filter((v: Video) => v.category?.split(',').includes(categoryFilter))
+          const availableVideos = [...videos.filter((v: Video) => !usedIds.has(v.id)), ...usedVideos].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+          const filtered = categoryFilter === 'unused' ? availableVideos.filter((v: Video) => !usedIds.has(v.id))
+            : categoryFilter === 'used' ? availableVideos.filter((v: Video) => usedIds.has(v.id))
+              : availableVideos
 
           return (
             <div className="px-4">
@@ -1072,13 +1154,25 @@ function App() {
                   <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
                     <span className="text-4xl grayscale opacity-50">🎬</span>
                   </div>
-                  <p className="text-gray-900 font-bold text-lg">{tab === 'gallery' ? 'No Videos Yet' : 'No Used Videos'}</p>
-                  <p className="text-gray-400 text-sm mt-1">{tab === 'gallery' ? 'Send a link to start dubbing' : 'Videos will appear here after being posted'}</p>
+                  <p className="text-gray-900 font-bold text-lg">No Videos Yet</p>
+                  <p className="text-gray-400 text-sm mt-1">Send a link to start dubbing</p>
                 </div>
               ) : (
                 <div className="grid grid-cols-3 gap-3">
                   {filtered.map((video) => (
-                    <VideoCard key={video.id} video={video} formatDuration={formatDuration} onDelete={(id) => { if (tab === 'gallery') setVideos(videos.filter(v => v.id !== id)); else setUsedVideos(usedVideos.filter(v => v.id !== id)) }} onUpdate={(id, fields) => { if (tab === 'gallery') setVideos(videos.map(v => v.id === id ? { ...v, ...fields } : v)); else setUsedVideos(usedVideos.map(v => v.id === id ? { ...v, ...fields } : v)) }} />
+                    <VideoCard
+                      key={video.id}
+                      video={video}
+                      formatDuration={formatDuration}
+                      onDelete={(id) => {
+                        setVideos(videos.filter(v => v.id !== id));
+                        setUsedVideos(usedVideos.filter(v => v.id !== id));
+                      }}
+                      onUpdate={(id, fields) => {
+                        setVideos(videos.map(v => v.id === id ? { ...v, ...fields } : v));
+                        setUsedVideos(usedVideos.map(v => v.id === id ? { ...v, ...fields } : v));
+                      }}
+                    />
                   ))}
                 </div>
               )}
@@ -1390,18 +1484,18 @@ function App() {
             onClick={() => setTab('home')}
           />
           <NavItem
+            icon={<ProcessIcon />}
+            iconActive={<ProcessIconFilled />}
+            label="Processing"
+            active={tab === 'processing'}
+            onClick={() => setTab('processing')}
+          />
+          <NavItem
             icon={<VideoIcon />}
             iconActive={<VideoIconFilled />}
             label="Gallery"
             active={tab === 'gallery'}
             onClick={() => setTab('gallery')}
-          />
-          <NavItem
-            icon={<UsedIcon />}
-            iconActive={<UsedIconFilled />}
-            label="Used"
-            active={tab === 'used'}
-            onClick={() => setTab('used')}
           />
           <NavItem
             icon={<ListIcon />}

@@ -13,7 +13,8 @@ import tempfile
 import subprocess
 import requests
 
-API_KEY = "AIzaSyAsRXea8uZS-EiRDuuWNhIXHj1Y1ZtHbqI"
+# Get API key from environment variable or use the new one as a fallback for local testing
+API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyDO3alwmA6p9xUV2O3VzX1Kfs9vKxycRzU")
 MODEL = "gemini-3-flash-preview"
 
 PROMPT = """คุณคือ "เฉียบ" สาวสองนักรีวิวสินค้าสุดแซ่บ พูดจากวนตีน จี๊ดจ๊าด ดราม่าเว่อร์ ชอบแซวคนดู ปากจัดแต่น่ารัก

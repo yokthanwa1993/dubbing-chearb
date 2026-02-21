@@ -258,6 +258,8 @@ def send_telegram(token, method, payload):
     return resp.json()
 
 def edit_status(token, chat_id, msg_id, text):
+    if not msg_id:
+        return
     send_telegram(token, "editMessageText", {
         "chat_id": chat_id,
         "message_id": msg_id,
@@ -277,6 +279,8 @@ class DotAnimator:
 
     def start(self, base_text):
         """เริ่ม animate — base_text ควรลงท้ายด้วยข้อความ step ปัจจุบัน (ไม่ต้องใส่จุด)"""
+        if not self.msg_id:
+            return
         self.stop()
         self._base_text = base_text
         self._stop.clear()
@@ -312,12 +316,29 @@ def run_pipeline_bg(payload):
     worker_url = payload["worker_url"]
 
     import uuid, time
-    video_id = uuid.uuid4().hex[:8]
+    video_id = payload.get("video_id") or uuid.uuid4().hex[:8]
+
+    def _update_step(step, step_name):
+        """อัปเดตสถานะ step ใน R2 _processing queue"""
+        try:
+            url = f"{worker_url}/api/r2-proxy/_processing/{video_id}.json"
+            get_req = http_requests.get(url, headers={'x-auth-token': token}, timeout=10)
+            if get_req.status_code == 200:
+                data = get_req.json()
+            else:
+                data = {"id": video_id, "status": "processing", "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            data["step"] = step
+            data["stepName"] = step_name
+            data["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            _r2_put(worker_url, token, f"_processing/{video_id}.json", json.dumps(data).encode(), "application/json")
+        except Exception as e:
+            print(f"[PIPELINE] Step update error: {e}")
 
     anim = DotAnimator(token, chat_id, msg_id)
 
     try:
         # ── Step 1: ดาวน์โหลดวิดีโอ ──
+        _update_step(1, "📥 ดาวน์โหลดวิดีโอ")
         anim.start("📥 กำลังดาวน์โหลดวิดีโอ")
 
         print(f"[PIPELINE] Downloading: {video_url[:80]}")
@@ -332,6 +353,7 @@ def run_pipeline_bg(payload):
                 f"videos/{video_id}_original.mp4", video_bytes, "video/mp4")
 
         # ── Step 2: Gemini upload + analyze ──
+        _update_step(2, "🔍 วิเคราะห์วิดีโอ")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 กำลังวิเคราะห์วิดีโอ")
 
         gemini_uri = _gemini_upload(video_bytes, api_key)
@@ -341,19 +363,22 @@ def run_pipeline_bg(payload):
         print(f"[PIPELINE] Script ({len(script)} chars): {script[:60]}")
 
         # ── Step 3: TTS ──
+        _update_step(3, "🎙 สร้างเสียงพากย์")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์")
 
         audio_b64 = _gemini_tts(script, api_key)
         print(f"[PIPELINE] TTS: {len(audio_b64)//1024} KB base64")
 
         # ── Step 4: FFmpeg merge ──
+        _update_step(4, "🎬 รวมวิดีโอ + ซับไตเติ้ล")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 สร้างเสียงพากย์ ✅\n🎬 กำลังรวมวิดีโอ")
 
         original_url = f"{r2_public_url}/videos/{video_id}_original.mp4"
-        merged_bytes, thumb_bytes, duration = _ffmpeg_merge(original_url, audio_b64)
+        merged_bytes, thumb_bytes, duration = _ffmpeg_merge(original_url, audio_b64, script, api_key)
         print(f"[PIPELINE] Merged: {len(merged_bytes)/1024/1024:.1f} MB, {duration:.1f}s")
 
         # ── Step 5: อัพโหลด ──
+        _update_step(5, "📤 อัพโหลดผลลัพธ์")
 
         _r2_put(worker_url, token,
                 f"videos/{video_id}.mp4", merged_bytes, "video/mp4")
@@ -365,15 +390,29 @@ def run_pipeline_bg(payload):
                     f"videos/{video_id}_thumb.webp", thumb_bytes, "image/webp")
             thumb_url = f"{r2_public_url}/videos/{video_id}_thumb.webp"
 
-        # ── Step 6: บันทึก metadata + pending shopee ──
+        # ── Step 6: เช็คลิงก์ Shopee ที่รออยู่ และบันทึก metadata ──
         import datetime
+        shopee_link_data = None
+        try:
+            get_req = http_requests.get(f"{worker_url}/api/r2-proxy/_waiting_shopee/{chat_id}.json", headers={'x-auth-token': token}, timeout=15)
+            if get_req.status_code == 200:
+                shopee_link_data = get_req.json().get("shopeeLink")
+                # ลบทิ้งทันทีหลังใช้
+                http_requests.delete(f"{worker_url}/api/r2-proxy/_waiting_shopee/{chat_id}.json", headers={'x-auth-token': token}, timeout=15)
+        except Exception as e:
+            print(f"[PIPELINE] Error fetching waiting shopee: {e}")
+
         metadata = {
             "id": video_id, "script": script, "title": title,
             "category": category, "duration": duration,
             "originalUrl": video_url, "publicUrl": public_url,
             "thumbnailUrl": thumb_url,
+            "chatId": chat_id,
             "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
         }
+        if shopee_link_data:
+            metadata["shopeeLink"] = shopee_link_data
+
         _r2_put(worker_url, token,
                 f"videos/{video_id}.json",
                 json.dumps(metadata, ensure_ascii=False).encode(), "application/json")
@@ -386,30 +425,71 @@ def run_pipeline_bg(payload):
         # ── Step 7: เสร็จ! ──
         anim.stop()
         edit_status(token, chat_id, msg_id,
-            "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 สร้างเสียงพากย์ ✅\n🎬 รวมวิดีโอ ✅")
+            "📥 รับวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 สร้างเสียงพากย์ ✅\n🎬 รวมวิดีโอ ✅")
 
-        send_telegram(token, "sendVideo", {
+
+
+
+        send_telegram(token, "sendMessage", {
             "chat_id": chat_id,
-            "video": public_url,
-            "caption": "🛒 ส่งลิงก์ Shopee มาเลย",
+            "text": "✅ สร้างวิดีโอสำเร็จ! ดูได้ที่คลังวิดีโอ",
             "reply_markup": {
                 "inline_keyboard": [[
-                    {"text": "🎥 เปิดคลัง", "web_app": {"url": "https://dubbing-chearb-webapp.pages.dev?tab=gallery"}}
+                    {"text": "🎥 เปิดคลังวิดีโอ", "web_app": {"url": "https://dubbing-chearb-webapp.pages.dev?tab=gallery"}}
                 ]]
             }
         })
 
+        # ลบ queue _processing
+        try:
+            http_requests.delete(f"{worker_url}/api/r2-proxy/_processing/{video_id}.json", headers={'x-auth-token': token}, timeout=15)
+        except Exception as e:
+            print(f"[PIPELINE] Error deleting processing state: {e}")
+
+        # อัปเดต Gallery cache เพื่อให้วิดีโอใหม่โผล่ทันที
+        try:
+            http_requests.post(f"{worker_url}/api/gallery/refresh/{video_id}", headers={'x-auth-token': token}, timeout=15)
+            print(f"[PIPELINE] Gallery cache refreshed for {video_id}")
+        except Exception as e:
+            print(f"[PIPELINE] Gallery refresh error: {e}")
+
         print(f"[PIPELINE] Done! videoId={video_id}")
 
     except Exception as e:
-        anim.stop()
+        if anim:
+            anim.stop()
         import traceback
         print(f"[PIPELINE] Error: {e}\n{traceback.format_exc()}")
-        send_telegram(token, "editMessageText", {
-            "chat_id": chat_id,
-            "message_id": msg_id,
-            "text": f"❌ ผิดพลาด\n\n{str(e)[:150]}",
-        })
+        if msg_id:
+            send_telegram(token, "editMessageText", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": f"❌ ผิดพลาด\n\n{str(e)[:150]}",
+            })
+        else:
+            send_telegram(token, "sendMessage", {
+                "chat_id": chat_id,
+                "text": f"❌ ระบบขัดข้องระหว่างสร้างวิดีโอพากย์เสียง\n\n{str(e)[:150]}",
+            })
+
+        # อัปเดตสถานะเป็น failed ในคิวแทนการลบ
+        try:
+            url = f"{worker_url}/api/r2-proxy/_processing/{video_id}.json"
+            get_req = http_requests.get(url, headers={'x-auth-token': token}, timeout=15)
+            if get_req.status_code == 200:
+                data = get_req.json()
+                data["status"] = "failed"
+                data["error"] = str(e)[:200]
+                _r2_put(worker_url, token, f"_processing/{video_id}.json", json.dumps(data).encode(), "application/json")
+        except Exception as e2:
+            print(f"[PIPELINE] Error updating failed status: {e2}")
+
+        # ไม่ว่าจะ fail ก็ให้เช็คคิวถัดไป
+        try:
+            http_requests.post(f"{worker_url}/api/queue/next", headers={'x-auth-token': token}, timeout=15)
+        except Exception as e3:
+            print(f"[PIPELINE] Queue next error: {e3}")
+
 
 
 def _r2_put(worker_url, token, key, data, content_type):
@@ -452,37 +532,54 @@ def _gemini_wait(file_uri, api_key, max_wait=120):
 
 def _gemini_script(file_uri, api_key, model):
     """สร้าง script ภาษาไทยจากวิดีโอ"""
-    prompt = """คุณคือ "พี่เฉียบ" นักรีวิวสินค้าออนไลน์สุดกวน พูดจาสนุก ตลก ชอบแซว ติดมุกตลอด แต่ข้อมูลแน่นจัดจ้าน
+    prompt = """คุณคือ "เฉียบ" สาวสองนักรีวิวสินค้าสุดแซ่บ พูดจากวนตีน จี๊ดจ๊าด ดราม่าเว่อร์ ชอบแซวคนดู ปากจัดแต่น่ารัก
 
 ดูวิดีโอสินค้านี้แล้วสร้าง script พากย์เสียงสำหรับ Facebook Reels
 
-สไตล์การพูด:
-- เปิดด้วยประโยคกวนๆ เช่น "นี่ไม่ใช่ของธรรมดานะจ๊ะ!" / "ใครไม่ซื้อ คือพลาดแบบแรงมาก!" / "โห้ เจ้านี่ เด็ดจริงอ่ะ!"
-- ใช้คำพูดที่สนุก ติดตลก มีอารมณ์ขัน เหมือนเพื่อนสนิทมาเล่าให้ฟัง
-- บรรยายจุดเด่นของสินค้าตามที่เห็นจริงในวิดีโอ อธิบายประโยชน์ให้ชัด
-- แทรกมุกเบาๆ เช่น "ใช้แล้วเปลี่ยนชีวิต ไม่ได้โม้!" / "แฟนเห็นต้องร้อง อุ๊ยยยย!"
-- ปิดด้วยประโยคชวนซื้อแบบกวน เช่น "สนใจกดสั่งเลย ช้าหมดนะจ้าาา!" / "ไม่ซื้อไม่ว่า แต่ว่าจะเสียใจ 555!"
+สไตล์ "เฉียบ":
+- เปิดด้วยประโยคจี๊ดๆ เช่น "แม่จ๋าา ของดีมาแล้วค่า!" / "อี๋ย ใครยังไม่มีอันนี้ เชยระเบิดเลยนะคะ!" / "ตายแล้วค่ะ ของมันต้องมี!"
+- พูดแบบสาวสองเต็มตัว ใช้คำว่า "ค่ะ" "จ๊ะ" "นะคะ" "แม่" "ตัวเอง" เยอะๆ ดราม่านิดๆ โอเวอร์หน่อยๆ
+- แซวคนดูแบบน่ารัก เช่น "ยังใช้ของเดิมอยู่เหรอจ๊ะ น่าสงสารตัวเอง!" / "ใช้แล้วสวยขึ้น ไม่ได้พูดเล่นนะคะ!"
+- บรรยายจุดเด่นสินค้าจริงจากวิดีโอ แต่ใส่อารมณ์โอเวอร์ เช่น "โอ้โห เห็นปุ๊บหัวใจแม่สั่นเลยค่ะ!" / "ดีจนอยากกรี๊ดดดด!"
+- ปิดด้วยทิ้งท้ายจี๊ดๆ เช่น "กดซื้อเลยค่ะ ไม่งั้นแม่จะโกรธ!" / "ไม่ซื้อก็ได้ค่ะ แต่อย่ามาร้องไห้ตอนของหมดนะจ๊ะ 555!" / "ลิงก์ข้างล่างจ้า แม่จัดให้แล้ว!"
 
-⚠️ ข้อห้าม: ห้ามพูดว่า "สวัสดีครับ/ค่ะ" ห้ามเปิดแบบน่าเบื่อ ต้องดึงดูดตั้งแต่คำแรก!
+⚠️ ข้อห้าม: ห้ามพูด "สวัสดี" ห้ามเรียบๆ น่าเบื่อ ต้องจี๊ดจ๊าดตั้งแต่คำแรก! กระชับแต่แซ่บ!
 
 ตอบเป็น JSON เท่านั้น:
 {
-  "thai_script": "script ภาษาไทยสนุกกวนๆ 150-300 ตัวอักษร ชวนซื้อแบบตลก",
-  "title": "แคปชั่นสั้นปังๆ ดึงดูดคนกด",
+  "thai_script": "script ภาษาไทยสไตล์สาวสองกวนๆ 150-300 ตัวอักษร จี๊ดจ๊าดชวนซื้อ",
+  "title": "แคปชั่นสั้นแซ่บๆ ดึงดูดคนกด",
   "category": "หมวดหมู่ (เครื่องมือช่าง/อาหาร/เครื่องครัว/ของใช้ในบ้าน/เฟอร์นิเจอร์/บิวตี้/แฟชั่น/อิเล็กทรอนิกส์/สุขภาพ/กีฬา/สัตว์เลี้ยง/ยานยนต์/อื่นๆ)"
 }"""
 
-    resp = http_requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-        json={"contents": [{"parts": [
-            {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
-            {"text": prompt}
-        ]}]},
-        timeout=60,
-    ).json()
+    import time
+    for attempt in range(5):
+        try:
+            resp = http_requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                json={"contents": [{"parts": [
+                    {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
+                    {"text": prompt}
+                ]}]},
+                timeout=60,
+            ).json()
 
-    if resp.get("error"):
-        raise Exception(f"Gemini error: {resp['error'].get('message')}")
+            if resp.get("error"):
+                err_msg = resp['error'].get('message', '')
+                if "high demand" in err_msg.lower() or "503" in str(err_msg):
+                    print(f"[PIPELINE] Gemini high demand, retrying... ({attempt+1}/5)")
+                    time.sleep(5)
+                    if attempt >= 2 and model == "gemini-3-flash-preview":
+                        model = "gemini-2.0-flash"
+                        print(f"[PIPELINE] Fallback to {model}")
+                    continue
+                raise Exception(f"Gemini error: {err_msg}")
+            break
+        except Exception as e:
+            if attempt < 4 and "Gemini error" not in str(e):
+                time.sleep(5)
+                continue
+            raise
 
     text = resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
     text = text.replace("```json", "").replace("```", "").strip()
@@ -500,26 +597,41 @@ def _gemini_script(file_uri, api_key, model):
 
 def _gemini_tts(script, api_key):
     """สร้างเสียงพากย์จาก script"""
-    resp = http_requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={api_key}",
-        json={
-            "contents": [{"parts": [{"text": script}]}],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}}
-            }
-        },
-        timeout=60,
-    ).json()
+    import time
+    for attempt in range(5):
+        try:
+            resp = http_requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={api_key}",
+                json={
+                    "contents": [{"parts": [{"text": script}]}],
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
+                    }
+                },
+                timeout=60,
+            ).json()
 
-    if resp.get("error"):
-        raise Exception(f"TTS error: {resp['error'].get('message')}")
+            if resp.get("error"):
+                err_msg = resp['error'].get('message', '')
+                if "high demand" in err_msg.lower() or "503" in str(err_msg):
+                    print(f"[PIPELINE] TTS high demand, retrying... ({attempt+1}/5)")
+                    time.sleep(5)
+                    continue
+                raise Exception(f"TTS error: {err_msg}")
+            
+            return resp["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+        except Exception as e:
+            if attempt < 4 and "TTS error" not in str(e):
+                time.sleep(5)
+                continue
+            raise
 
     return resp["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
 
 
-def _ffmpeg_merge(video_url, audio_b64):
-    """FFmpeg merge — เหมือน /merge endpoint เดิม แต่ return bytes"""
+def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None):
+    """FFmpeg merge — เหมือน /merge endpoint เดิม แต่มีการใส่ซับด้วย Whisper + Gemini + MoviePy"""
     with tempfile.TemporaryDirectory() as tmpdir:
         vr = http_requests.get(video_url, timeout=120)
         video_path = os.path.join(tmpdir, "video.mp4")
@@ -554,14 +666,136 @@ def _ffmpeg_merge(video_url, audio_b64):
         else:
             subprocess.run(["ffmpeg", "-y", "-i", wav_audio, "-t", str(duration), adjusted], capture_output=True)
 
-        output_path = os.path.join(tmpdir, "output.mp4")
+        merged_nosub = os.path.join(tmpdir, "merged_nosub.mp4")
         mr = subprocess.run([
             "ffmpeg", "-y", "-i", video_path, "-i", adjusted,
             "-c:v", "copy", "-c:a", "aac",
-            "-map", "0:v:0", "-map", "1:a:0", "-t", str(duration), output_path
+            "-map", "0:v:0", "-map", "1:a:0", "-t", str(duration), merged_nosub
         ], capture_output=True, text=True)
         if mr.returncode != 0:
             raise Exception(f"FFmpeg failed: {mr.stderr[:300]}")
+            
+        output_path = os.path.join(tmpdir, "output.mp4")
+        
+        if script and api_key:
+            print("[PIPELINE] Transcribing with Whisper (Tiny model)...")
+            try:
+                subprocess.run([
+                    "whisper-ctranslate2", adjusted,
+                    "--model", "tiny",
+                    "--language", "th",
+                    "--output_format", "srt",
+                    "--output_dir", tmpdir,
+                    "--compute_type", "int8",
+                    "--word_timestamps", "True",
+                    "--max_line_width", "20",
+                    "--max_line_count", "1"
+                ], check=True, timeout=120)  # 2 min timeout
+            except subprocess.TimeoutExpired:
+                raise Exception("Whisper transcription timed out (>120s)")
+            except subprocess.CalledProcessError as e:
+                raise Exception(f"Whisper failed: {e}")
+            
+            srt_name = os.path.splitext(os.path.basename(adjusted))[0] + ".srt"
+            srt_path = os.path.join(tmpdir, srt_name)
+            
+            with open(srt_path, "r", encoding="utf-8") as fs:
+                raw_srt_text = fs.read()
+                
+            print("[PIPELINE] Translating/Fixing SRT with Gemini...")
+            prompt = f"""คุณคือผู้เชี่ยวชาญด้านการตัดต่อ Subtitle วิดีโอสั้นสไตล์ TikTok/Reels แบบคำปังๆ เน้นขึ้นโชว์ทีละบรรทัดสั้นๆ
+นี่คือต้นฉบับบทพากย์ที่ถูกต้อง (Original Script):
+{script}
+
+และนี่คือไฟล์ SRT ที่ได้จากเสียงพูด:
+{raw_srt_text}
+
+คำสั่งบังคับ (สำคัญมากต้องทำตาม):
+1. แปลงข้อมูลเป็น SRT ใหม่ ให้เนื้อหาซับไตเติ้ลแสดงผล "ทีละ 1 บรรทัดเท่านั้น" ห้ามมีการขึ้นบรรทัดใหม่ ใน 1 block
+2. หั่นประโยคให้สั้น (กะประมาณไม่เกิน 15-20 ตัวอักษรต่อ 1 block SRT) เพื่อให้อ่านทันทีละจังหวะสั้นๆ
+3. เนื้อหาและคำศัพท์ต้องถูกต้อง 100% ตาม "Original Script" ห้ามมีคำผิดแหลมมา (แก้คำที่ Whisper แปลงมามั่วให้ถูกเป๊ะๆ)
+4. คุณต้อง "คำนวณแบ่งและสร้าง Timestamps ใหม่" โดยซอย block ยาวๆ ให้เป็น block สั้นๆ ตามสัดส่วนความยาวคำให้เนียนที่สุด โดยให้เวลาเริ่มและเวลาจบครอบคลุมตาม SRT ของเดิมอย่าให้ล้น
+5. เลี่ยงการตัดคำที่มีความหมายติดกัน
+6. ตอบกลับมาแค่เนื้อหา SRT ล้วนๆ ห้ามตอบอย่างอื่น ห้ามมี markdown ```srt
+
+SRT ที่แก้ไขแล้ว:"""
+            import time
+            sub_model = "gemini-3-flash-preview"
+            for attempt in range(5):
+                try:
+                    gemini_resp = http_requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{sub_model}:generateContent?key={api_key}",
+                        json={"contents": [{"parts": [{"text": prompt}]}]},
+                        timeout=60,
+                    ).json()
+                    
+                    if gemini_resp.get("error"):
+                        err_msg = gemini_resp['error'].get('message', '')
+                        if "high demand" in err_msg.lower() or "503" in str(err_msg):
+                            print(f"[PIPELINE] Subtitle Gemini high demand, retrying... ({attempt+1}/5)")
+                            time.sleep(5)
+                            if attempt >= 2 and sub_model == "gemini-3-flash-preview":
+                                sub_model = "gemini-2.0-flash"
+                                print(f"[PIPELINE] Fallback subtitle model to {sub_model}")
+                            continue
+                        print(f"[PIPELINE] Gemini Subtitling error: {err_msg}")
+                        fixed_srt_content = raw_srt_text
+                        break
+                    else:
+                        fixed_srt_content = gemini_resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        fixed_srt_content = fixed_srt_content.replace("```srt", "").replace("```", "").strip()
+                        break
+                except Exception as e:
+                    if attempt < 4:
+                        time.sleep(5)
+                        continue
+                    print(f"[PIPELINE] Gemini Subtitle Exception: {e}")
+                    fixed_srt_content = raw_srt_text
+                    break
+                
+            with open(srt_path, "w", encoding="utf-8") as fs:
+                fs.write(fixed_srt_content)
+                
+            subtitles = _parse_srt(srt_path)
+            
+            from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
+            import numpy as np
+            import shutil
+            
+            video_clip = VideoFileClip(merged_nosub)
+            vw, vh = video_clip.w, video_clip.h
+
+            text_clips = []
+            font_size = int(vw * 0.115)
+            if font_size < 50: font_size = 50
+
+            for (start, end, raw_text) in subtitles:
+                seg_dur = end - start
+                if seg_dur <= 0:
+                    continue
+                if start >= duration:
+                    break
+                
+                seg = raw_text.replace("\\n", " ").replace("\n", " ").strip()
+                try:
+                    img_np = _create_subtitle_image(seg, vw, vh, font_size=font_size)
+                    img_clip = ImageClip(img_np)
+                    img_clip = img_clip.set_start(start).set_duration(seg_dur)
+                    text_clips.append(img_clip)
+                except Exception as e:
+                    print(f"[PIPELINE] Skip subtitle: {e}")
+                    
+            if text_clips:
+                final = CompositeVideoClip([video_clip] + text_clips)
+                final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='fast', logger=None)
+                video_clip.close()
+                final.close()
+            else:
+                video_clip.close()
+                shutil.move(merged_nosub, output_path)
+        else:
+            import shutil
+            shutil.move(merged_nosub, output_path)
 
         op = subprocess.run([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -584,6 +818,74 @@ def _ffmpeg_merge(video_url, audio_b64):
                 thumb = f.read()
 
         return merged, thumb, out_dur
+
+
+def _time_to_seconds(time_str):
+    time_str = time_str.replace(',', '.')
+    parts = time_str.split(':')
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+
+def _parse_srt(srt_file):
+    with open(srt_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    blocks = re.split(r'\n\s*\n', content.strip())
+    subtitles = []
+    
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            time_line = lines[1]
+            match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', time_line)
+            if match:
+                start = _time_to_seconds(match.group(1))
+                end = _time_to_seconds(match.group(2))
+                text = '\n'.join(lines[2:])
+                subtitles.append((start, end, text))
+    
+    return subtitles
+
+
+def _create_subtitle_image(text, width, height, font_size=50):
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+    import os
+    
+    font_paths = [
+        "font.ttf",
+        "/System/Library/Fonts/ThonburiUI.ttc",
+    ]
+    font = None
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except:
+                continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    if hasattr(draw, 'textbbox'):
+        bbox = draw.textbbox((0, 0), text, font=font, align='center')
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    else:
+        text_width, text_height = draw.textsize(text, font=font)
+    
+    x = (width - text_width) // 2
+    y = (height - text_height) // 2
+    
+    stroke_w = int(font_size * 0.05)
+    if stroke_w < 2: stroke_w = 2
+    
+    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), align='center', stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
+    
+    return np.array(img)
 
 
 @app.route("/pipeline", methods=["POST"])
