@@ -1539,9 +1539,77 @@ export class MergeContainer extends Container {
     sleepAfter = '10m'
 }
 
+/** Watchdog: ตรวจจับ job ค้าง → ย้ายกลับ queue เพื่อ retry (สูงสุด 3 ครั้ง) */
+async function watchdogStuckJobs(env: Env) {
+    const MAX_RETRIES = 3
+    const STUCK_THRESHOLD_MS = 5 * 60 * 1000 // 5 นาที
+
+    try {
+        const list = await env.BUCKET.list({ prefix: '_processing/' })
+        if (list.objects.length === 0) return
+
+        const now = Date.now()
+
+        for (const obj of list.objects) {
+            const data = await env.BUCKET.get(obj.key)
+            if (!data) continue
+
+            const job = await data.json() as {
+                id: string; videoUrl: string; chatId: number;
+                shopeeLink?: string; updatedAt?: string; createdAt?: string;
+                retryCount?: number; step?: number; stepName?: string;
+            }
+
+            // เช็คว่าค้างหรือยัง
+            const lastUpdate = job.updatedAt || job.createdAt || obj.uploaded.toISOString()
+            const elapsed = now - new Date(lastUpdate).getTime()
+
+            if (elapsed < STUCK_THRESHOLD_MS) continue // ยังไม่ค้าง
+
+            const retryCount = (job.retryCount || 0) + 1
+            const stuckStep = job.stepName || `step ${job.step || '?'}`
+
+            console.log(`[WATCHDOG] Job ${job.id} stuck at "${stuckStep}" for ${Math.round(elapsed / 1000)}s (retry #${retryCount})`)
+
+            // ลบจาก _processing/
+            await env.BUCKET.delete(obj.key)
+
+            if (retryCount > MAX_RETRIES) {
+                // เกิน 3 ครั้ง → ถือว่า failed
+                console.log(`[WATCHDOG] Job ${job.id} exceeded max retries (${MAX_RETRIES}), marking as failed`)
+                await sendTelegram(env.TELEGRAM_BOT_TOKEN, 'sendMessage', {
+                    chat_id: job.chatId,
+                    text: `❌ วิดีโอ ${job.id} ล้มเหลวหลัง retry ${MAX_RETRIES} ครั้ง\nกรุณาส่งลิงก์ใหม่อีกครั้ง`,
+                }).catch(() => { })
+            } else {
+                // ย้ายกลับ _queue/ เพื่อ retry
+                await env.BUCKET.put(`_queue/${job.id}.json`, JSON.stringify({
+                    id: job.id,
+                    videoUrl: job.videoUrl,
+                    chatId: job.chatId,
+                    shopeeLink: job.shopeeLink || '',
+                    createdAt: new Date().toISOString(),
+                    status: 'queued',
+                    retryCount,
+                }), {
+                    httpMetadata: { contentType: 'application/json' },
+                })
+                console.log(`[WATCHDOG] Job ${job.id} moved back to queue (retry #${retryCount})`)
+            }
+        }
+
+        // ลบ processing ค้างทั้งหมดแล้ว → ลองเริ่มอันถัดไปในคิว
+        await processNextInQueue(env)
+    } catch (e) {
+        console.error('[WATCHDOG] Error:', e instanceof Error ? e.message : String(e))
+    }
+}
+
 export default {
     fetch: app.fetch,
     scheduled: async (event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
+        // Watchdog ทำงานก่อน → ตรวจจับ job ค้าง + retry
+        await watchdogStuckJobs(env)
         await handleScheduled(env)
     },
 }

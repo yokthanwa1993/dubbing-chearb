@@ -359,7 +359,25 @@ def run_pipeline_bg(payload):
         gemini_uri = _gemini_upload(video_bytes, api_key)
         gemini_uri = _gemini_wait(gemini_uri, api_key)
 
-        script, title, category = _gemini_script(gemini_uri, api_key, model)
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            tf.write(video_bytes)
+            tmp_video_path = tf.name
+            
+        try:
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", tmp_video_path
+            ], capture_output=True, text=True)
+            duration = float(probe.stdout.strip()) if probe.stdout.strip() else 15.0
+        except Exception as e:
+            print(f"[PIPELINE] Error getting duration: {e}")
+            duration = 15.0
+        finally:
+            os.remove(tmp_video_path)
+
+        script, title, category = _gemini_script(gemini_uri, api_key, model, duration)
         print(f"[PIPELINE] Script ({len(script)} chars): {script[:60]}")
 
         # ── Step 3: TTS ──
@@ -530,11 +548,17 @@ def _gemini_wait(file_uri, api_key, max_wait=120):
     return file_uri
 
 
-def _gemini_script(file_uri, api_key, model):
-    """สร้าง script ภาษาไทยจากวิดีโอ"""
-    prompt = """คุณคือ "เฉียบ" สาวสองนักรีวิวสินค้าสุดแซ่บ พูดจากวนตีน จี๊ดจ๊าด ดราม่าเว่อร์ ชอบแซวคนดู ปากจัดแต่น่ารัก
+def _gemini_script(file_uri, api_key, model, video_duration=15.0):
+    """สร้าง script ภาษาไทยจากวิดีโอ — ปรับความยาว script ตามความยาววิดีโอ"""
+    # คำนวณความยาว script ที่เหมาะสม (~10 ตัวอักษร/วินาที สำหรับภาษาไทย TTS)
+    max_chars = min(int(video_duration * 10), 800)
+    min_chars = max(int(video_duration * 7), 80)
+
+    prompt = f"""คุณคือ "เฉียบ" สาวสองนักรีวิวสินค้าสุดแซ่บ พูดจากวนตีน จี๊ดจ๊าด ดราม่าเว่อร์ ชอบแซวคนดู ปากจัดแต่น่ารัก
 
 ดูวิดีโอสินค้านี้แล้วสร้าง script พากย์เสียงสำหรับ Facebook Reels
+
+⏱️ สำคัญมาก: วิดีโอนี้ยาว {video_duration:.1f} วินาที เท่านั้น! Script ต้องบรรยายยาวไปจนจบวิดีโอ!
 
 สไตล์ "เฉียบ":
 - เปิดด้วยประโยคจี๊ดๆ เช่น "แม่จ๋าา ของดีมาแล้วค่า!" / "อี๋ย ใครยังไม่มีอันนี้ เชยระเบิดเลยนะคะ!" / "ตายแล้วค่ะ ของมันต้องมี!"
@@ -545,12 +569,14 @@ def _gemini_script(file_uri, api_key, model):
 
 ⚠️ ข้อห้าม: ห้ามพูด "สวัสดี" ห้ามเรียบๆ น่าเบื่อ ต้องจี๊ดจ๊าดตั้งแต่คำแรก! กระชับแต่แซ่บ!
 
+⚠️ ความยาว: Script ต้องยาว {min_chars}-{max_chars} ตัวอักษรเท่านั้น สำคัญมาก! ห้ามสั้นเกินไปเพราะวิดีโอยาวตั้ง {video_duration:.0f} วินาที
+
 ตอบเป็น JSON เท่านั้น:
-{
-  "thai_script": "script ภาษาไทยสไตล์สาวสองกวนๆ 150-300 ตัวอักษร จี๊ดจ๊าดชวนซื้อ",
+{{
+  "thai_script": "script ภาษาไทยสไตล์สาวสองกวนๆ {min_chars}-{max_chars} ตัวอักษร จี๊ดจ๊าดชวนซื้อ",
   "title": "แคปชั่นสั้นแซ่บๆ ดึงดูดคนกด",
   "category": "หมวดหมู่ (เครื่องมือช่าง/อาหาร/เครื่องครัว/ของใช้ในบ้าน/เฟอร์นิเจอร์/บิวตี้/แฟชั่น/อิเล็กทรอนิกส์/สุขภาพ/กีฬา/สัตว์เลี้ยง/ยานยนต์/อื่นๆ)"
-}"""
+}}"""
 
     import time
     for attempt in range(5):
@@ -715,8 +741,9 @@ def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None):
 2. หั่นประโยคให้สั้น (กะประมาณไม่เกิน 15-20 ตัวอักษรต่อ 1 block SRT) เพื่อให้อ่านทันทีละจังหวะสั้นๆ
 3. เนื้อหาและคำศัพท์ต้องถูกต้อง 100% ตาม "Original Script" ห้ามมีคำผิดแหลมมา (แก้คำที่ Whisper แปลงมามั่วให้ถูกเป๊ะๆ)
 4. คุณต้อง "คำนวณแบ่งและสร้าง Timestamps ใหม่" โดยซอย block ยาวๆ ให้เป็น block สั้นๆ ตามสัดส่วนความยาวคำให้เนียนที่สุด โดยให้เวลาเริ่มและเวลาจบครอบคลุมตาม SRT ของเดิมอย่าให้ล้น
-5. เลี่ยงการตัดคำที่มีความหมายติดกัน
-6. ตอบกลับมาแค่เนื้อหา SRT ล้วนๆ ห้ามตอบอย่างอื่น ห้ามมี markdown ```srt
+5. เลี่ยงการตัดคำที่มีความหมายติดกัน (เช่น 'เชยระเบิด' ไม่ควรแยก 'เชย' กับ 'ระเบิด' ข้ามเวลา)
+6. ⚠️ ห้ามเอาข้อความสอง block หรือสองวรรคมาต่อกันแบบไม่มีเว้นวรรค เช่น "ดูความแบ๊วสิคะแม่ ขี่" หรือ "งอร้านสะดวกซื้อปาก" จะต้องแบ่งเป็นคำที่มีความหมายสมบูรณ์ "ดูความแบ๊วสิคะแม่", "ง้อร้านสะดวกซื้อปากซอย" 
+7. ตอบกลับมาแค่เนื้อหา SRT ล้วนๆ ห้ามตอบอย่างอื่น ห้ามมี markdown ```srt
 
 SRT ที่แก้ไขแล้ว:"""
             import time
@@ -769,10 +796,23 @@ SRT ที่แก้ไขแล้ว:"""
             font_size = int(vw * 0.115)
             if font_size < 50: font_size = 50
 
-            for (start, end, raw_text) in subtitles:
+            last_end = 0
+            for i, (start, end, raw_text) in enumerate(subtitles):
+                # ป้องกันซับทับซ้อน (Overlap) โดยจัด start ใหม่ถ้ามันเริ่มก่อนที่อันเก่าจะจบ
+                if start < last_end:
+                    start = last_end
+                
+                # ป้องกันซับทับซ้อน (Overlap) โดยจบให้พอดีกับอันถัดไปถ้ามันล้ำ
+                if i + 1 < len(subtitles):
+                    next_start = subtitles[i+1][0]
+                    if end > next_start:
+                        end = next_start
+
                 seg_dur = end - start
                 if seg_dur <= 0:
                     continue
+                last_end = end
+                
                 if start >= duration:
                     break
                 
