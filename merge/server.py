@@ -797,80 +797,34 @@ SRT ที่แก้ไขแล้ว:"""
             with open(srt_path, "w", encoding="utf-8") as fs:
                 fs.write(fixed_srt_content)
                 
-            subtitles = _parse_srt(srt_path)
+            ass_path = os.path.join(tmpdir, "subtitles.ass")
             
-            from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
-            import numpy as np
-            import shutil
+            vp = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x", merged_nosub
+            ], capture_output=True, text=True)
+            res = vp.stdout.strip().split('x')
+            vw = int(res[0]) if len(res) == 2 else 1080
+            vh = int(res[1]) if len(res) == 2 else 1920
             
-            video_clip = VideoFileClip(merged_nosub)
-            vw, vh = video_clip.w, video_clip.h
-
-            text_clips = []
-            font_size = int(vw * 0.115)
-            if font_size < 50: font_size = 50
-
-            last_end = 0
-            for i, (start, end, raw_text) in enumerate(subtitles):
-                # ป้องกันซับทับซ้อน (Overlap) โดยจัด start ใหม่ถ้ามันเริ่มก่อนที่อันเก่าจะจบ
-                if start < last_end:
-                    start = last_end
-                
-                # ป้องกันซับทับซ้อน (Overlap) โดยจบให้พอดีกับอันถัดไปถ้ามันล้ำ
-                if i + 1 < len(subtitles):
-                    next_start = subtitles[i+1][0]
-                    if end > next_start:
-                        end = next_start
-
-                seg_dur = end - start
-                if seg_dur <= 0:
-                    continue
-                last_end = end
-                
-                if start >= duration:
-                    break
-                
-                seg = raw_text.replace("\\n", " ").replace("\n", " ").strip()
-                try:
-                    img_np = _create_subtitle_image(seg, vw, vh, font_size=font_size)
-                    img_clip = ImageClip(img_np)
-                    img_clip = img_clip.set_start(start).set_duration(seg_dur)
-                    text_clips.append(img_clip)
-                except Exception as e:
-                    print(f"[PIPELINE] Skip subtitle: {e}")
-                    
-            if text_clips:
-                final = CompositeVideoClip([video_clip] + text_clips)
-                
-                if progress_cb:
-                    from proglog import ProgressBarLogger
-                    import time
-                    class MergeLogger(ProgressBarLogger):
-                        def __init__(self):
-                            super().__init__()
-                            self.last_update = 0
-                            self.last_pct = -1
-                        def bars_callback(self, bar, attr, value, old_value):
-                            if bar == 'chunk' or bar == 't':
-                                now = time.time()
-                                if now - self.last_update > 2.0:
-                                    self.last_update = now
-                                    total = self.bars[bar]['total']
-                                    if total > 0:
-                                        pct = int((value / total) * 100)
-                                        if pct != self.last_pct:
-                                            self.last_pct = pct
-                                            progress_cb(f"🎬 กำลังวาดซับไตเติ้ล ({pct}%)")
-                    
-                    final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='ultrafast', threads=2, logger=MergeLogger())
-                else:
-                    final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='ultrafast', threads=2, logger=None)
-                    
-                video_clip.close()
-                final.close()
-            else:
-                video_clip.close()
+            _convert_to_ass(srt_path, ass_path, vw, vh)
+            
+            print("[PIPELINE] Burning subtitles with FFmpeg Native...")
+            if progress_cb:
+                progress_cb("🎬 กำลังฝังซับไตเติ้ล (Hardware Accelerated)...")
+            
+            # Use Native FFmpeg ASS plugin, pointing fontsdir to /app where font.ttf resides
+            mr = subprocess.run([
+                "ffmpeg", "-y", "-i", merged_nosub,
+                "-vf", f"ass={ass_path}:fontsdir=/app",
+                "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", output_path
+            ], capture_output=True, text=True)
+            
+            if mr.returncode != 0:
+                print(f"[PIPELINE] FFmpeg sub error: {mr.stderr[-1000:] if hasattr(mr, 'stderr') and mr.stderr else 'Unknown'}")
+                import shutil
                 shutil.move(merged_nosub, output_path)
+                
         else:
             import shutil
             shutil.move(merged_nosub, output_path)
@@ -898,72 +852,38 @@ SRT ที่แก้ไขแล้ว:"""
         return merged, thumb, out_dur
 
 
-def _time_to_seconds(time_str):
-    time_str = time_str.replace(',', '.')
-    parts = time_str.split(':')
-    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-
-
-def _parse_srt(srt_file):
+def _convert_to_ass(srt_file, ass_file, vw, vh):
     with open(srt_file, 'r', encoding='utf-8') as f:
-        content = f.read()
+        srt_content = f.read()
     
-    blocks = re.split(r'\n\s*\n', content.strip())
-    subtitles = []
+    font_size = int(vw * 0.115)
+    if font_size < 50: font_size = 50
     
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {vw}
+PlayResY: {vh}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,FC Iconic,{font_size},&H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,2,10,10,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    blocks = srt_content.strip().split('\n\n')
     for block in blocks:
-        lines = block.strip().split('\n')
+        lines = block.split('\n')
         if len(lines) >= 3:
-            time_line = lines[1]
-            match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', time_line)
-            if match:
-                start = _time_to_seconds(match.group(1))
-                end = _time_to_seconds(match.group(2))
-                text = '\n'.join(lines[2:])
-                subtitles.append((start, end, text))
-    
-    return subtitles
-
-
-def _create_subtitle_image(text, width, height, font_size=50):
-    from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
-    import os
-    
-    font_paths = [
-        "font.ttf",
-        "/System/Library/Fonts/ThonburiUI.ttc",
-    ]
-    font = None
-    for fp in font_paths:
-        if os.path.exists(fp):
-            try:
-                font = ImageFont.truetype(fp, font_size)
-                break
-            except:
-                continue
-    if font is None:
-        font = ImageFont.load_default()
-
-    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    
-    if hasattr(draw, 'textbbox'):
-        bbox = draw.textbbox((0, 0), text, font=font, align='center')
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-    else:
-        text_width, text_height = draw.textsize(text, font=font)
-    
-    x = (width - text_width) // 2
-    y = (height - text_height) // 2
-    
-    stroke_w = int(font_size * 0.05)
-    if stroke_w < 2: stroke_w = 2
-    
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), align='center', stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
-    
-    return np.array(img)
+            times = lines[1].split(' --> ')
+            start = times[0].replace(',', '.')[:-1] 
+            end = times[1].replace(',', '.')[:-1]
+            text = " ".join(lines[2:]).replace('\n', '\\N')
+            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+            
+    with open(ass_file, 'w', encoding='utf-8') as f:
+        f.write(ass_header + '\n'.join(events))
 
 
 @app.route("/pipeline", methods=["POST"])
