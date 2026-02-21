@@ -946,9 +946,10 @@ function App() {
     }
   }
 
-  const handleDeleteProcessing = async (id: string) => {
+  const handleCancelJob = async (id: string, isQueued: boolean) => {
     try {
-      await fetch(`${WORKER_URL}/api/processing/${id}`, { method: 'DELETE' })
+      const endpoint = isQueued ? 'queue' : 'processing'
+      await fetch(`${WORKER_URL}/api/${endpoint}/${id}`, { method: 'DELETE' })
       setProcessingVideos(prev => prev.filter(v => v.id !== id))
     } catch { }
   }
@@ -1075,14 +1076,13 @@ function App() {
               <div className="space-y-3">
                 {processingVideos.map((video: any) => (
                   <div key={video.id} className="flex gap-3 bg-white border border-gray-100 rounded-2xl p-3 shadow-sm relative">
-                    {video.status === 'failed' && (
-                      <button
-                        onClick={() => handleDeleteProcessing(video.id)}
-                        className="absolute top-2 right-2 p-1.5 bg-red-50 text-red-500 rounded-full hover:bg-red-100 transition-colors"
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-                      </button>
-                    )}
+                    <button
+                      onClick={() => handleCancelJob(video.id, video.status === 'queued')}
+                      title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
+                      className={`absolute top-2 right-2 p-1.5 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-100 text-gray-500 hover:bg-red-50 hover:text-red-500'}`}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+                    </button>
                     {/* Placeholder for processing video thumbnail */}
                     <div className={`w-24 h-32 rounded-xl flex flex-col items-center justify-center shrink-0 relative overflow-hidden ${video.status === 'failed' ? 'bg-red-50' : video.status === 'queued' ? 'bg-amber-50' : 'bg-gray-100'}`}>
                       <div className={`absolute inset-0 bg-gradient-to-tr ${video.status === 'failed' ? 'from-red-200 to-red-50' : video.status === 'queued' ? 'from-amber-100 to-amber-50' : 'from-blue-100 to-gray-50'} opacity-50`}></div>

@@ -353,6 +353,7 @@ app.get('/api/processing', async (c) => {
 app.delete('/api/processing/:id', async (c) => {
     try {
         await c.env.BUCKET.delete(`_processing/${c.req.param('id')}.json`)
+        c.executionCtx.waitUntil(processNextInQueue(c.env))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -395,6 +396,17 @@ app.get('/api/queue', async (c) => {
         return c.json({ queue: items })
     } catch (e) {
         return c.json({ queue: [], error: String(e) })
+    }
+})
+
+// Delete queue item
+app.delete('/api/queue/:id', async (c) => {
+    try {
+        await c.env.BUCKET.delete(`_queue/${c.req.param('id')}.json`)
+        c.executionCtx.waitUntil(processNextInQueue(c.env))
+        return c.json({ ok: true })
+    } catch (e) {
+        return c.json({ error: String(e) }, 500)
     }
 })
 
@@ -1542,7 +1554,7 @@ export class MergeContainer extends Container {
 /** Watchdog: ตรวจจับ job ค้าง → ย้ายกลับ queue เพื่อ retry (สูงสุด 3 ครั้ง) */
 async function watchdogStuckJobs(env: Env) {
     const MAX_RETRIES = 3
-    const STUCK_THRESHOLD_MS = 5 * 60 * 1000 // 5 นาที
+    const STUCK_THRESHOLD_MS = 15 * 60 * 1000 // 15 นาที
 
     try {
         const list = await env.BUCKET.list({ prefix: '_processing/' })
