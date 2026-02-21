@@ -392,7 +392,21 @@ def run_pipeline_bg(payload):
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 สร้างเสียงพากย์ ✅\n🎬 กำลังรวมวิดีโอ")
 
         original_url = f"{r2_public_url}/videos/{video_id}_original.mp4"
-        merged_bytes, thumb_bytes, duration = _ffmpeg_merge(original_url, audio_b64, script, api_key)
+
+        def update_progress(text):
+            try:
+                import datetime
+                url_get = f"{worker_url}/api/r2-proxy/_processing/{video_id}.json"
+                req = http_requests.get(url_get, headers={'x-auth-token': token}, timeout=5)
+                if req.status_code == 200:
+                    data = req.json()
+                    data["stepName"] = text
+                    data["updatedAt"] = datetime.datetime.utcnow().isoformat() + "Z"
+                    _r2_put(worker_url, token, f"_processing/{video_id}.json", json.dumps(data).encode(), "application/json")
+            except:
+                pass
+
+        merged_bytes, thumb_bytes, duration = _ffmpeg_merge(original_url, audio_b64, script, api_key, progress_cb=update_progress)
         print(f"[PIPELINE] Merged: {len(merged_bytes)/1024/1024:.1f} MB, {duration:.1f}s")
 
         # ── Step 5: อัพโหลด ──
@@ -656,7 +670,7 @@ def _gemini_tts(script, api_key):
     return resp["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
 
 
-def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None):
+def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None, progress_cb=None):
     """FFmpeg merge — เหมือน /merge endpoint เดิม แต่มีการใส่ซับด้วย Whisper + Gemini + MoviePy"""
     with tempfile.TemporaryDirectory() as tmpdir:
         vr = http_requests.get(video_url, timeout=120)
@@ -827,7 +841,31 @@ SRT ที่แก้ไขแล้ว:"""
                     
             if text_clips:
                 final = CompositeVideoClip([video_clip] + text_clips)
-                final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='fast', logger=None)
+                
+                if progress_cb:
+                    from proglog import ProgressBarLogger
+                    import time
+                    class MergeLogger(ProgressBarLogger):
+                        def __init__(self):
+                            super().__init__()
+                            self.last_update = 0
+                            self.last_pct = -1
+                        def bars_callback(self, bar, attr, value, old_value):
+                            if bar == 'chunk' or bar == 't':
+                                now = time.time()
+                                if now - self.last_update > 2.0:
+                                    self.last_update = now
+                                    total = self.bars[bar]['total']
+                                    if total > 0:
+                                        pct = int((value / total) * 100)
+                                        if pct != self.last_pct:
+                                            self.last_pct = pct
+                                            progress_cb(f"🎬 กำลังวาดซับไตเติ้ล ({pct}%)")
+                    
+                    final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='ultrafast', threads=2, logger=MergeLogger())
+                else:
+                    final.write_videofile(output_path, codec='libx264', audio_codec='aac', preset='ultrafast', threads=2, logger=None)
+                    
                 video_clip.close()
                 final.close()
             else:
