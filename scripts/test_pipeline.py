@@ -237,90 +237,39 @@ SRT ที่แก้ไขแล้ว:"""
         return srt_content
 
 
-def split_script_to_segments(script):
-    """แบ่ง script เป็นท่อนสั้นๆ ตามเครื่องหมายวรรคตอน"""
-def time_to_seconds(time_str):
-    """แปลงเวลา SRT เป็นวินาที"""
-    time_str = time_str.replace(',', '.')
-    parts = time_str.split(':')
-    hours = int(parts[0])
-    minutes = int(parts[1])
-    seconds = float(parts[2])
-    return hours * 3600 + minutes * 60 + seconds
-
-
-def parse_srt(srt_file):
-    """อ่านไฟล์ SRT"""
+def convert_to_ass(srt_file, ass_file, vw, vh):
     with open(srt_file, 'r', encoding='utf-8') as f:
-        content = f.read()
+        srt_content = f.read()
     
-    import re
-    blocks = re.split(r'\n\s*\n', content.strip())
-    subtitles = []
+    # Scale font size optimally (~11.5% of width)
+    font_size = int(vw * 0.115)
+    if font_size < 50: font_size = 50
     
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {vw}
+PlayResY: {vh}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,FC Iconic,{font_size},&H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,2,10,10,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    blocks = srt_content.strip().split('\n\n')
     for block in blocks:
-        lines = block.strip().split('\n')
+        lines = block.split('\n')
         if len(lines) >= 3:
-            time_line = lines[1]
-            match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', time_line)
-            if match:
-                start = time_to_seconds(match.group(1))
-                end = time_to_seconds(match.group(2))
-                text = '\n'.join(lines[2:])
-                subtitles.append((start, end, text))
-    
-    return subtitles
-
-
-def create_subtitle_image(text, width, height, font_size=50):
-    from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
-    
-    # ดึงลิสต์ฟอนต์จาก render_subs แบบฉบับสมบูรณ์
-    font_paths = [
-        "/Users/yok/Developer/dubbing-chearb/FC Iconic Bold.ttf",
-        "/System/Library/Fonts/ThonburiUI.ttc",
-        "/System/Library/Fonts/Supplemental/Thonburi.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-    ]
-    font = None
-    for fp in font_paths:
-        if os.path.exists(fp):
-            try:
-                font = ImageFont.truetype(fp, font_size)
-                break
-            except:
-                continue
-    if font is None:
-        font = ImageFont.load_default()
-
-    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    
-    # รองรับ Pillow version ใหม่และเก่า
-    if hasattr(draw, 'textbbox'):
-        bbox = draw.textbbox((0, 0), text, font=font, align='center')
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-    elif hasattr(draw, 'multilinebbox'):
-        bbox = draw.multilinebbox((0, 0), text, font=font, align='center')
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-    else:
-        text_width, text_height = draw.textsize(text, font=font)
-    
-    x = (width - text_width) // 2
-    # ให้ข้อความอยู่ตรงกลางจอ (ทั้งซ้าย-ขวา และ บน-ล่าง)
-    y = (height - text_height) // 2
-    
-    # ความหนาขอบลดลงเหลือ 5% ของขนาดฟอนต์ (ไม่หนาเกินไปจนดูรก)
-    stroke_w = int(font_size * 0.05)
-    if stroke_w < 2: stroke_w = 2
-    
-    # วาดตัวหนังสือสีขาวพร้อมขอบ (ใช้ draw.text ธรรมดาก็พอเพราะมีบรรทัดเดียว 100%)
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), align='center', stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
-    
-    return np.array(img)
+            times = lines[1].split(' --> ')
+            start = times[0].replace(',', '.')[:-1] 
+            end = times[1].replace(',', '.')[:-1]
+            text = " ".join(lines[2:]).replace('\n', '\\N')
+            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+            
+    with open(ass_file, 'w', encoding='utf-8') as f:
+        f.write(ass_header + '\n'.join(events))
 
 
 def ffmpeg_merge(video_path, audio_b64, output_path, script=None):
@@ -367,10 +316,8 @@ def ffmpeg_merge(video_path, audio_b64, output_path, script=None):
         if mr.returncode != 0:
             raise Exception(f"FFmpeg merge failed: {mr.stderr[-500:]}")
 
-        # Burn subtitle ด้วย moviepy + PIL rendering
-        # Burn subtitle ด้วย moviepy + PIL rendering + Whisper SRT
+        # Burn subtitle ด้วย FFmpeg Native
         if script:
-            import re
             print(f"📝 Transcribing ด้วย Whisper เพื่อเวลาที่เป๊ะที่สุด...")
             subprocess.run([
                 "whisper-ctranslate2", adjusted,
@@ -387,74 +334,53 @@ def ffmpeg_merge(video_path, audio_b64, output_path, script=None):
             srt_name = os.path.splitext(os.path.basename(adjusted))[0] + ".srt"
             srt_path = os.path.join(tmpdir, srt_name)
             
-            # อ่าน SRT เก่าที่มาจาก Whisper
             with open(srt_path, "r", encoding="utf-8") as fs:
                 raw_srt_text = fs.read()
             
-            # โยนให้ Gemini แก้คำผิด + จัดบรรทัดใหม่
             fixed_srt_content = fix_srt_with_gemini(raw_srt_text, script)
             
-            # เขียนกลับลงไปที่ไฟล์ (เผื่อไว้ debug ได้)
             with open(srt_path, "w", encoding="utf-8") as fs:
                 fs.write(fixed_srt_content)
                 
-            subtitles = parse_srt(srt_path)
+            ass_path = os.path.join(tmpdir, "subtitles.ass")
             
-            print(f"   ✅ แปลงเป็นซับเสร็จสิ้น: {len(subtitles)} ประโยค")
-
-            from moviepy import VideoFileClip, ImageClip, CompositeVideoClip
-
-            video_clip = VideoFileClip(merged_nosub)
-            vw, vh = video_clip.w, video_clip.h
-
-            text_clips = []
-
-            # เพิ่มขนาดฟอนต์ให้ใหญ่ขึ้นอีก (จาก 0.085 -> 0.115 ~ ยักษ์กระแทกตามากๆ)
-            font_size = int(vw * 0.115)
-            if font_size < 50: font_size = 50
-
-            last_end = 0
-            for i, (start, end, raw_text) in enumerate(subtitles):
-                # ป้องกันซับทับซ้อน (Overlap) โดยจัด start ใหม่ถ้ามันเริ่มก่อนที่อันเก่าจะจบ
-                if start < last_end:
-                    start = last_end
-                
-                # ป้องกันซับทับซ้อน (Overlap) โดยจบให้พอดีกับอันถัดไปถ้ามันล้ำ
-                if i + 1 < len(subtitles):
-                    next_start = subtitles[i+1][0]
-                    if end > next_start:
-                        end = next_start
-
-                seg_dur = end - start
-                if seg_dur <= 0:
-                    continue
-                last_end = end
-                
-                # เอาเฉพาะซับที่พอดี video
-                if start >= duration:
-                    break
-                
-                # ลบเครื่องหมายประหลาด และเอา \n ออกเพื่อบังคับให้เป็นบรรทัดเดียวตามที่ Gemini ตัดมาให้
-                seg = raw_text.replace("\n", " ").strip()
-                
-                try:
-                    img_np = create_subtitle_image(seg, vw, vh, font_size=font_size)
-                    img_clip = ImageClip(img_np)
-                    img_clip = img_clip.with_start(start).with_duration(seg_dur)
-                    text_clips.append(img_clip)
-                except Exception as e:
-                    print(f"   ⚠️ ข้ามซับ: {e}")
-
-            if text_clips:
-                final = CompositeVideoClip([video_clip] + text_clips)
-                final.write_videofile(output_path, codec='libx264', audio_codec='aac',
-                                     preset='fast', logger=None)
-                video_clip.close()
-                final.close()
+            vp = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x", merged_nosub
+            ], capture_output=True, text=True)
+            res = vp.stdout.strip().split('x')
+            vw = int(res[0]) if len(res) == 2 else 1080
+            vh = int(res[1]) if len(res) == 2 else 1920
+            
+            convert_to_ass(srt_path, ass_path, vw, vh)
+            
+            print(f"🎬 กำลังฝังซับไตเติ้ลด้วย FFmpeg Native (Hardware Accelerated)...")
+            
+            ffmpeg_check = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
+            if " ass " in ffmpeg_check.stdout:
+                mr = subprocess.run([
+                    "ffmpeg", "-y", "-i", merged_nosub,
+                    "-vf", f"ass={ass_path}",
+                    "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", output_path
+                ], capture_output=True, text=True)
             else:
-                video_clip.close()
+                print("   [INFO] ไม่พบ libass ใน FFmpeg เครื่องนี้ -> อัญเชิญ Docker มาทำแทน!")
+                cwd_cmd = os.path.abspath(tmpdir)
+                out_name = os.path.basename(output_path)
+                out_dir = os.path.abspath(os.path.dirname(output_path))
+                mr = subprocess.run([
+                    "docker", "run", "--rm", "-v", f"{cwd_cmd}:/tmpdir", "-v", f"{out_dir}:/outdir",
+                    "-w", "/tmpdir", "mwader/static-ffmpeg:7.0.2",
+                    "-y", "-i", "merged_nosub.mp4",
+                    "-vf", "ass=subtitles.ass",
+                    "-c:v", "libx264", "-c:a", "copy", "-preset", "ultrafast", f"/outdir/{out_name}"
+                ], capture_output=True, text=True)
+                
+            if mr.returncode != 0:
+                print(f"   ⚠️ FFmpeg sub error: {mr.stderr[-1000:] if hasattr(mr, 'stderr') and mr.stderr else 'Unknown'}")
                 import shutil
                 shutil.move(merged_nosub, output_path)
+                
         else:
             import shutil
             shutil.move(merged_nosub, output_path)
