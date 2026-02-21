@@ -140,17 +140,25 @@ def gemini_script(file_uri, video_duration):
   "category": "หมวดหมู่ (เครื่องมือช่าง/อาหาร/เครื่องครัว/ของใช้ในบ้าน/เฟอร์นิเจอร์/บิวตี้/แฟชั่น/อิเล็กทรอนิกส์/สุขภาพ/กีฬา/สัตว์เลี้ยง/ยานยนต์/อื่นๆ)"
 }}"""
 
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}",
-        json={"contents": [{"parts": [
-            {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
-            {"text": prompt}
-        ]}]},
-        timeout=60,
-    ).json()
+    import time
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}",
+                json={"contents": [{"parts": [
+                    {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
+                    {"text": prompt}
+                ]}]},
+                timeout=120,
+            ).json()
 
-    if resp.get("error"):
-        raise Exception(f"Gemini error: {resp['error'].get('message')}")
+            if resp.get("error"):
+                raise Exception(f"Gemini error: {resp['error'].get('message')}")
+            break
+        except Exception as e:
+            if attempt == 2: raise
+            print(f"   ⚠️ Gemini script timeout/error, retrying... ({attempt+1}/3)")
+            time.sleep(5)
 
     text = resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
     text = text.replace("```json", "").replace("```", "").strip()
@@ -175,20 +183,28 @@ def gemini_script(file_uri, video_duration):
 
 def gemini_tts(script):
     print(f"🎙️ สร้างเสียงพากย์...")
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={API_KEY}",
-        json={
-            "contents": [{"parts": [{"text": script}]}],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
-            }
-        },
-        timeout=60,
-    ).json()
+    import time
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={API_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": script}]}],
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
+                    }
+                },
+                timeout=120,
+            ).json()
 
-    if resp.get("error"):
-        raise Exception(f"TTS error: {resp['error'].get('message')}")
+            if resp.get("error"):
+                raise Exception(f"TTS error: {resp['error'].get('message')}")
+            break
+        except Exception as e:
+            if attempt == 2: raise
+            print(f"   ⚠️ TTS timeout/error, retrying... ({attempt+1}/3)")
+            time.sleep(5)
 
     audio_b64 = resp["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
     print(f"   ✅ เสียง {len(audio_b64)//1024} KB")
@@ -215,26 +231,33 @@ def fix_srt_with_gemini(srt_content, original_script):
 
 SRT ที่แก้ไขแล้ว:"""
 
-    try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}]
-            },
-            timeout=60,
-        ).json()
-        
-        if resp.get("error"):
-            print(f"   ⚠️ Gemini Subtitling error: {resp['error'].get('message')}")
-            return srt_content
+    import time
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}]
+                },
+                timeout=120,
+            ).json()
             
-        fixed_srt = resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        fixed_srt = fixed_srt.replace("```srt", "").replace("```", "").strip()
-        print(f"   ✅ Gemini Flash แก้ซับไตเติ้ลเรียบร้อย!")
-        return fixed_srt
-    except Exception as e:
-        print(f"   ⚠️ Gemini Error: {e}")
-        return srt_content
+            if resp.get("error"):
+                print(f"   ⚠️ Gemini Subtitling error: {resp['error'].get('message')}")
+                if attempt == 2: return srt_content
+                time.sleep(5)
+                continue
+                
+            fixed_srt = resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            fixed_srt = fixed_srt.replace("```srt", "").replace("```", "").strip()
+            print(f"   ✅ Gemini Flash แก้ซับไตเติ้ลเรียบร้อย!")
+            return fixed_srt
+        except Exception as e:
+            if attempt == 2:
+                print(f"   ⚠️ Gemini Error: {e}")
+                return srt_content
+            print(f"   ⚠️ Subtitle fix timeout/error, retrying... ({attempt+1}/3)")
+            time.sleep(5)
 
 
 def convert_to_ass(srt_file, ass_file, vw, vh):
@@ -260,13 +283,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = []
     blocks = srt_content.strip().split('\n\n')
     for block in blocks:
-        lines = block.split('\n')
-        if len(lines) >= 3:
-            times = lines[1].split(' --> ')
-            start = times[0].replace(',', '.')[:-1] 
-            end = times[1].replace(',', '.')[:-1]
-            text = " ".join(lines[2:]).replace('\n', '\\N')
-            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+        lines = [l.strip() for l in block.split('\n') if l.strip()]
+        if not lines: continue
+        
+        time_idx = -1
+        for i, l in enumerate(lines):
+            if '-->' in l:
+                time_idx = i
+                break
+                
+        if time_idx != -1 and time_idx + 1 < len(lines):
+            times = lines[time_idx].split('-->')
+            if len(times) == 2:
+                def fmt_time(t):
+                    t = t.strip().replace(',', '.')
+                    parts = t.split(':')
+                    if len(parts) == 3:
+                        h = int(parts[0])
+                        m = parts[1].zfill(2)
+                        s_ms = parts[2].split('.')
+                        s = s_ms[0].zfill(2)
+                        ms = s_ms[1] if len(s_ms) > 1 else "000"
+                        cs = ms[:2].ljust(2, '0')
+                        return f"{h}:{m}:{s}.{cs}"
+                    return t
+                
+                start = fmt_time(times[0])
+                end = fmt_time(times[1])
+                text = " ".join(lines[time_idx+1:]).replace('\n', '\\N')
+                events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
             
     with open(ass_file, 'w', encoding='utf-8') as f:
         f.write(ass_header + '\n'.join(events))
@@ -353,33 +398,63 @@ def ffmpeg_merge(video_path, audio_b64, output_path, script=None):
             vh = int(res[1]) if len(res) == 2 else 1920
             
             convert_to_ass(srt_path, ass_path, vw, vh)
-            
             print(f"🎬 กำลังฝังซับไตเติ้ลด้วย FFmpeg Native (Hardware Accelerated)...")
+            
+            import shutil
+            shutil.copy(srt_path, os.path.abspath("debug_subtitles.srt"))
+            shutil.copy(ass_path, os.path.abspath("debug_subtitles.ass"))
+            
+            font_src = os.path.abspath("FC Iconic Bold.ttf")
             
             ffmpeg_check = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
             if " ass " in ffmpeg_check.stdout:
+                cwd_cmd = os.path.abspath(tmpdir)
+                if os.path.exists(font_src):
+                    shutil.copy(font_src, os.path.join(cwd_cmd, "font.ttf"))
+                
                 mr = subprocess.run([
                     "ffmpeg", "-y", "-i", merged_nosub,
-                    "-vf", f"ass={ass_path}",
+                    "-vf", f"ass={ass_path}:fontsdir={cwd_cmd}",
                     "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", output_path
                 ], capture_output=True, text=True)
             else:
                 print("   [INFO] ไม่พบ libass ใน FFmpeg เครื่องนี้ -> อัญเชิญ Docker มาทำแทน!")
-                cwd_cmd = os.path.abspath(tmpdir)
+                
+                # macOS Docker can't mount /var/folders (symlink) -> use project dir instead
+                docker_work = os.path.abspath("_docker_work")
+                os.makedirs(docker_work, exist_ok=True)
+                
+                shutil.copy(merged_nosub, os.path.join(docker_work, "input.mp4"))
+                shutil.copy(ass_path, os.path.join(docker_work, "subtitles.ass"))
+                if os.path.exists(font_src):
+                    shutil.copy(font_src, os.path.join(docker_work, "font.ttf"))
+                
                 out_name = os.path.basename(output_path)
-                out_dir = os.path.abspath(os.path.dirname(output_path))
+                out_dir = os.path.abspath(os.path.dirname(output_path) or ".")
+                
+                print(f"   📂 Docker work dir: {docker_work}")
+                print(f"   📂 Output dir: {out_dir}")
+                
                 mr = subprocess.run([
-                    "docker", "run", "--rm", "-v", f"{cwd_cmd}:/tmpdir", "-v", f"{out_dir}:/outdir",
-                    "-w", "/tmpdir", "mwader/static-ffmpeg:7.0.2",
-                    "-y", "-i", "merged_nosub.mp4",
-                    "-vf", "ass=subtitles.ass",
-                    "-c:v", "libx264", "-c:a", "copy", "-preset", "ultrafast", f"/outdir/{out_name}"
+                    "docker", "run", "--rm", 
+                    "-v", f"{docker_work}:/work", 
+                    "-v", f"{out_dir}:/outdir",
+                    "-w", "/work", 
+                    "-e", "HOME=/work",
+                    "mwader/static-ffmpeg:7.0.2",
+                    "-y", "-i", "input.mp4",
+                    "-vf", "ass=subtitles.ass:fontsdir=/work",
+                    "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", f"/outdir/{out_name}"
                 ], capture_output=True, text=True)
+                
+                # cleanup docker work dir
+                shutil.rmtree(docker_work, ignore_errors=True)
                 
             if mr.returncode != 0:
                 print(f"   ⚠️ FFmpeg sub error: {mr.stderr[-1000:] if hasattr(mr, 'stderr') and mr.stderr else 'Unknown'}")
-                import shutil
                 shutil.move(merged_nosub, output_path)
+            else:
+                print(f"   ✅ Docker FFmpeg log:\n{mr.stderr[-1000:]}")
                 
         else:
             import shutil

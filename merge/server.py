@@ -342,10 +342,24 @@ def run_pipeline_bg(payload):
         anim.start("📥 กำลังดาวน์โหลดวิดีโอ")
 
         print(f"[PIPELINE] Downloading: {video_url[:80]}")
-        vr = http_requests.get(video_url, timeout=120)
+        vr = http_requests.get(video_url, stream=True, timeout=120)
         if vr.status_code != 200:
             raise Exception(f"Download failed: {vr.status_code}")
-        video_bytes = vr.content
+        
+        total_size = int(vr.headers.get('content-length', 0))
+        video_bytes = bytearray()
+        last_pct = 0
+        for chunk in vr.iter_content(chunk_size=1024*1024):
+            if chunk:
+                video_bytes.extend(chunk)
+                if total_size > 0:
+                    pct = len(video_bytes) / total_size
+                    # Only update every 10% or strictly to reduce R2 spam
+                    if pct - last_pct > 0.1 or pct == 1.0:
+                        _update_step(1.0 + (pct * 0.9), f"📥 กำลังดาวน์โหลดวิดีโอ... ({len(video_bytes)/1024/1024:.1f}MB)")
+                        last_pct = pct
+
+        video_bytes = bytes(video_bytes)
         print(f"[PIPELINE] Downloaded: {len(video_bytes)/1024/1024:.1f} MB")
 
         # อัพโหลด original ไป R2 ผ่าน Worker proxy
@@ -353,10 +367,11 @@ def run_pipeline_bg(payload):
                 f"videos/{video_id}_original.mp4", video_bytes, "video/mp4")
 
         # ── Step 2: Gemini upload + analyze ──
-        _update_step(2, "🔍 วิเคราะห์วิดีโอ")
+        _update_step(2, "🔍 อัปโหลดวิดีโอไป Gemini...")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 กำลังวิเคราะห์วิดีโอ")
 
         gemini_uri = _gemini_upload(video_bytes, api_key)
+        _update_step(2.3, "🔍 รอ Gemini ประมวลผลวิดีโอ...")
         gemini_uri = _gemini_wait(gemini_uri, api_key)
 
         import tempfile
@@ -377,23 +392,25 @@ def run_pipeline_bg(payload):
         finally:
             os.remove(tmp_video_path)
 
+        _update_step(2.7, "🔍 สร้างบทพากย์จาก AI...")
         script, title, category = _gemini_script(gemini_uri, api_key, model, duration)
         print(f"[PIPELINE] Script ({len(script)} chars): {script[:60]}")
 
         # ── Step 3: TTS ──
-        _update_step(3, "🎙 สร้างเสียงพากย์")
+        _update_step(3, "🎙 กำลังสร้างเสียงพากย์ไทย...")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์")
 
         audio_b64 = _gemini_tts(script, api_key)
+        _update_step(3.5, "🎙 ได้เสียงพากย์แล้ว กำลังเตรียมรวม...")
         print(f"[PIPELINE] TTS: {len(audio_b64)//1024} KB base64")
 
         # ── Step 4: FFmpeg merge ──
-        _update_step(4, "🎬 รวมวิดีโอ + ซับไตเติ้ล")
+        _update_step(4, "🎬 กำลังรวมเสียง+วิดีโอ...")
         anim.start("📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 สร้างเสียงพากย์ ✅\n🎬 กำลังรวมวิดีโอ")
 
         original_url = f"{r2_public_url}/videos/{video_id}_original.mp4"
 
-        def update_progress(text):
+        def update_progress(text, step_num=None):
             try:
                 import datetime
                 url_get = f"{worker_url}/api/r2-proxy/_processing/{video_id}.json"
@@ -401,6 +418,8 @@ def run_pipeline_bg(payload):
                 if req.status_code == 200:
                     data = req.json()
                     data["stepName"] = text
+                    if step_num:
+                        data["step"] = step_num
                     data["updatedAt"] = datetime.datetime.utcnow().isoformat() + "Z"
                     _r2_put(worker_url, token, f"_processing/{video_id}.json", json.dumps(data).encode(), "application/json")
             except:
@@ -718,11 +737,14 @@ def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None, progress_cb=N
         output_path = os.path.join(tmpdir, "output.mp4")
         
         if script and api_key:
-            print("[PIPELINE] Transcribing with Whisper (Tiny model)...")
+            if progress_cb:
+                progress_cb("📝 กำลังวิเคราะห์และแกะเวลาเสียงพูด (Word Sync)...", 4.3)
+                
+            print("[PIPELINE] Transcribing with Whisper (Turbo model)...")
             try:
                 subprocess.run([
                     "whisper-ctranslate2", adjusted,
-                    "--model", "tiny",
+                    "--model", "turbo",
                     "--language", "th",
                     "--output_format", "srt",
                     "--output_dir", tmpdir,
@@ -730,9 +752,9 @@ def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None, progress_cb=N
                     "--word_timestamps", "True",
                     "--max_line_width", "20",
                     "--max_line_count", "1"
-                ], check=True, timeout=120)  # 2 min timeout
+                ], check=True, timeout=300)  # 5 min timeout
             except subprocess.TimeoutExpired:
-                raise Exception("Whisper transcription timed out (>120s)")
+                raise Exception("Whisper transcription timed out (>300s)")
             except subprocess.CalledProcessError as e:
                 raise Exception(f"Whisper failed: {e}")
             
@@ -741,6 +763,9 @@ def _ffmpeg_merge(video_url, audio_b64, script=None, api_key=None, progress_cb=N
             
             with open(srt_path, "r", encoding="utf-8") as fs:
                 raw_srt_text = fs.read()
+                
+            if progress_cb:
+                progress_cb("✨ กำลังแปลและจัดเรียงซับไตเติ้ล...", 4.6)
                 
             print("[PIPELINE] Translating/Fixing SRT with Gemini...")
             prompt = f"""คุณคือผู้เชี่ยวชาญด้านการตัดต่อ Subtitle วิดีโอสั้นสไตล์ TikTok/Reels แบบคำปังๆ เน้นขึ้นโชว์ทีละบรรทัดสั้นๆ
@@ -811,17 +836,43 @@ SRT ที่แก้ไขแล้ว:"""
             
             print("[PIPELINE] Burning subtitles with FFmpeg Native...")
             if progress_cb:
-                progress_cb("🎬 กำลังฝังซับไตเติ้ล (Hardware Accelerated)...")
+                progress_cb("🎬 กำลังเตรียมซับไตเติ้ล...", 4.8)
             
             # Use Native FFmpeg ASS plugin, pointing fontsdir to /app where font.ttf resides
-            mr = subprocess.run([
+            import re
+            
+            cmd = [
                 "ffmpeg", "-y", "-i", merged_nosub,
+                "-progress", "-", "-nostats",
                 "-vf", f"ass={ass_path}:fontsdir=/app",
                 "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", output_path
-            ], capture_output=True, text=True)
+            ]
             
-            if mr.returncode != 0:
-                print(f"[PIPELINE] FFmpeg sub error: {mr.stderr[-1000:] if hasattr(mr, 'stderr') and mr.stderr else 'Unknown'}")
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            
+            last_pct = 0
+            for line in p.stdout:
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        us_val = line.split("=")[1]
+                        if us_val != "N/A":
+                            current_sec = int(us_val) / 1000000.0
+                            if duration > 0:
+                                pct = min(1.0, current_sec / duration)
+                                if pct - last_pct > 0.05 or pct == 1.0:
+                                    if progress_cb:
+                                        # Map 0..1 to 4.8..4.99
+                                        progress_cb(f"🎬 กำลังฝังซับไตเติ้ล ({current_sec:.1f}s / {duration:.1f}s)", 4.8 + (pct * 0.19))
+                                    last_pct = pct
+                    except Exception:
+                        pass
+                        
+            p.wait()
+            
+            if p.returncode != 0:
+                print(f"[PIPELINE] FFmpeg sub error: returncode {p.returncode}")
+                # Fallback on merge_nosub if subtitle burning fails completely
                 import shutil
                 shutil.move(merged_nosub, output_path)
                 
@@ -874,13 +925,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = []
     blocks = srt_content.strip().split('\n\n')
     for block in blocks:
-        lines = block.split('\n')
-        if len(lines) >= 3:
-            times = lines[1].split(' --> ')
-            start = times[0].replace(',', '.')[:-1] 
-            end = times[1].replace(',', '.')[:-1]
-            text = " ".join(lines[2:]).replace('\n', '\\N')
-            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+        lines = [l.strip() for l in block.split('\n') if l.strip()]
+        if not lines: continue
+        
+        time_idx = -1
+        for i, l in enumerate(lines):
+            if '-->' in l:
+                time_idx = i
+                break
+                
+        if time_idx != -1 and time_idx + 1 < len(lines):
+            times = lines[time_idx].split('-->')
+            if len(times) == 2:
+                def fmt_time(t):
+                    t = t.strip().replace(',', '.')
+                    parts = t.split(':')
+                    if len(parts) == 3:
+                        h = int(parts[0])
+                        m = parts[1].zfill(2)
+                        s_ms = parts[2].split('.')
+                        s = s_ms[0].zfill(2)
+                        ms = s_ms[1] if len(s_ms) > 1 else "000"
+                        cs = ms[:2].ljust(2, '0')
+                        return f"{h}:{m}:{s}.{cs}"
+                    return t
+                
+                start = fmt_time(times[0])
+                end = fmt_time(times[1])
+                text = " ".join(lines[time_idx+1:]).replace('\n', '\\N')
+                events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
             
     with open(ass_file, 'w', encoding='utf-8') as f:
         f.write(ass_header + '\n'.join(events))

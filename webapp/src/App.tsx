@@ -757,6 +757,71 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   )
 }
 
+function ProcessingCard({ video, onCancel }: { video: any, onCancel: (id: string, isQueued: boolean) => void }) {
+  const displayProgress = video.status === 'queued' ? 0 : Math.max(5, Math.min(100, Math.floor(((video.step || 0) / 5) * 100)));
+
+  return (
+    <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm relative flex flex-col gap-3">
+      {/* Top Row: ID + Cancel form */}
+      <div className="flex justify-between items-start">
+        <div className="flex items-center gap-3">
+          <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${video.status === 'failed' ? 'bg-red-50 text-red-500' : video.status === 'queued' ? 'bg-amber-50 text-amber-500' : 'bg-blue-50 text-blue-500'}`}>
+            {video.status === 'failed' ? '❌' : video.status === 'queued' ? '⏳' : (
+              <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent animate-spin rounded-full" />
+            )}
+          </div>
+          <div className="flex flex-col">
+            <p className="font-extrabold text-gray-900 text-sm">ID: {video.id}</p>
+            <p className="text-[10px] text-gray-400 font-medium">เริ่มเมื่อ {new Date(video.createdAt).toLocaleTimeString('th-TH')}</p>
+          </div>
+        </div>
+        <button
+          onClick={() => onCancel(video.id, video.status === 'queued')}
+          title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
+          className={`p-2 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-50 text-gray-400 hover:bg-red-50 hover:text-red-500'}`}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      {/* Middle Row: Status Text + Link + % */}
+      <div className="flex justify-between items-end mt-1">
+        <div className="flex flex-col gap-1.5 flex-1 pr-4 min-w-0">
+          <div className="flex items-center gap-1.5">
+            {video.status === 'failed' ? (
+              <span className="text-xs bg-red-50 text-red-600 px-2 py-0.5 rounded-md font-bold shrink-0 truncate">{video.error || 'ล้มเหลว'}</span>
+            ) : video.status === 'queued' ? (
+              <span className="text-xs bg-amber-50 text-amber-600 px-2 py-0.5 rounded-md font-bold shrink-0">กำลังรอคิว...</span>
+            ) : (
+              <span className="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-md font-bold shrink-0 truncate break-all line-clamp-1">{video.stepName || 'กำลังประมวลผล...'}</span>
+            )}
+          </div>
+          <p className="text-[10px] text-gray-500 flex items-center gap-1.5 truncate">
+            <span className="w-4 h-4 rounded-full bg-gray-50 flex items-center justify-center shrink-0"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
+            <span className="truncate">{video.shopeeLink || 'ไม่มีลิงก์ Shopee'}</span>
+          </p>
+        </div>
+
+        {video.status !== 'failed' && (
+          <div className="text-right shrink-0">
+            <span className="text-lg font-black text-blue-600">{video.status === 'queued' ? '0' : displayProgress}%</span>
+          </div>
+        )}
+      </div>
+
+      {/* Bottom Row: Progress Bar */}
+      {video.status !== 'failed' && (
+        <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden relative">
+          <div
+            className={`h-2.5 rounded-full transition-all duration-300 ease-linear ${video.status === 'queued' ? 'bg-amber-400' : 'bg-gradient-to-r from-blue-500 to-indigo-500'}`}
+            style={{ width: `${Math.max(2, displayProgress)}%` }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [stats, setStats] = useState<Stats>({ total: 0, completed: 0, processing: 0, failed: 0 })
   const [postHistory, setPostHistory] = useState<PostHistory[]>([])
@@ -1075,59 +1140,7 @@ function App() {
             ) : (
               <div className="space-y-3">
                 {processingVideos.map((video: any) => (
-                  <div key={video.id} className="flex gap-3 bg-white border border-gray-100 rounded-2xl p-3 shadow-sm relative">
-                    <button
-                      onClick={() => handleCancelJob(video.id, video.status === 'queued')}
-                      title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
-                      className={`absolute top-2 right-2 p-1.5 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-100 text-gray-500 hover:bg-red-50 hover:text-red-500'}`}
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-                    </button>
-                    {/* Placeholder for processing video thumbnail */}
-                    <div className={`w-24 h-32 rounded-xl flex flex-col items-center justify-center shrink-0 relative overflow-hidden ${video.status === 'failed' ? 'bg-red-50' : video.status === 'queued' ? 'bg-amber-50' : 'bg-gray-100'}`}>
-                      <div className={`absolute inset-0 bg-gradient-to-tr ${video.status === 'failed' ? 'from-red-200 to-red-50' : video.status === 'queued' ? 'from-amber-100 to-amber-50' : 'from-blue-100 to-gray-50'} opacity-50`}></div>
-                      {video.status === 'failed' ? (
-                        <span className="text-2xl relative z-10">❌</span>
-                      ) : video.status === 'queued' ? (
-                        <span className="text-2xl relative z-10">⏳</span>
-                      ) : (
-                        <>
-                          <div className="w-8 h-8 rounded-full border-2 border-blue-500 border-t-transparent animate-spin z-10" />
-                          {video.step && <p className="text-[10px] text-blue-600 font-bold mt-1.5 z-10">{video.step}/5</p>}
-                        </>
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0 py-1 flex flex-col pr-6">
-                      <div className="flex justify-between items-start gap-2">
-                        <p className="font-bold text-gray-900 text-sm line-clamp-2">ID: {video.id}</p>
-                      </div>
-                      <div className="mt-1">
-                        {video.status === 'failed' ? (
-                          <span className="text-[10px] bg-red-50 text-red-600 px-2 py-0.5 rounded-md font-bold shrink-0">ล้มเหลว</span>
-                        ) : video.status === 'queued' ? (
-                          <span className="text-[10px] bg-amber-50 text-amber-600 px-2 py-0.5 rounded-md font-bold shrink-0">⏳ รอคิว</span>
-                        ) : (
-                          <span className="text-[10px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded-md font-bold shrink-0">{video.stepName || 'กำลังประมวลผล'}</span>
-                        )}
-                      </div>
-                      {/* Step progress bar */}
-                      {video.status !== 'failed' && video.step && (
-                        <div className="mt-1.5 w-full bg-gray-200 rounded-full h-1.5">
-                          <div className="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${(video.step / 5) * 100}%` }} />
-                        </div>
-                      )}
-                      <div className="mt-auto space-y-1.5">
-                        {video.status === 'failed' && video.error && (
-                          <p className="text-[10px] text-red-500 font-medium truncate" title={video.error}>{video.error}</p>
-                        )}
-                        <p className="text-[10px] text-gray-500 flex items-center gap-1.5 truncate">
-                          <span className="w-4 h-4 rounded-full bg-gray-100 flex items-center justify-center shrink-0"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
-                          {video.shopeeLink || 'ไม่มีลิงก์ Shopee'}
-                        </p>
-                        <p className="text-[10px] text-gray-400 font-medium">เริ่มเมื่อ: {new Date(video.createdAt).toLocaleTimeString('th-TH')}</p>
-                      </div>
-                    </div>
-                  </div>
+                  <ProcessingCard key={video.id} video={video} onCancel={handleCancelJob} />
                 ))}
               </div>
             )}
