@@ -24,6 +24,9 @@ app.use('*', async (c, next) => {
         if (parts.length >= 4) token = parts[3];
     }
     const botId = getBotId(token);
+    if (!c.req.path.startsWith('/api/telegram/') && !c.req.path.startsWith('/api/r2')) {
+        console.log(`[API REQUEST] path: ${c.req.path} | raw-token: ${token?.substring(0, 15)} | botId: ${botId}`)
+    }
     c.set('botId', botId);
     c.set('bucket', new BotBucket(c.env.BUCKET, botId) as unknown as R2Bucket);
     await next();
@@ -31,6 +34,42 @@ app.use('*', async (c, next) => {
 
 // Health check
 app.get('/', (c) => c.json({ status: 'ok', service: 'dubbing-chearb-worker' }))
+
+// TEMP MIGRATION ENDPOINT
+app.get('/api/migrate-bucket-back', async (c) => {
+    const fromPrefix = c.req.query('from') || '8328894625/'
+    const toPrefix = c.req.query('to') || ''
+
+    try {
+        const bucket = c.env.BUCKET
+        const list = await bucket.list({ prefix: fromPrefix })
+        const stats = { copied: 0, skipped: 0, errors: [] as string[] }
+
+        for (const obj of list.objects) {
+            // we only want things starting with 8328894625/
+            if (!obj.key.startsWith(fromPrefix)) continue;
+            const newKey = obj.key.replace(fromPrefix, toPrefix);
+
+            try {
+                const oldObj = await bucket.get(obj.key)
+                if (oldObj) {
+                    await bucket.put(newKey, oldObj.body, {
+                        httpMetadata: oldObj.httpMetadata,
+                        customMetadata: oldObj.customMetadata
+                    })
+                    stats.copied++
+                } else {
+                    stats.skipped++
+                }
+            } catch (err: any) {
+                stats.errors.push(`Failed to copy ${obj.key}: ${err.message}`)
+            }
+        }
+        return c.json({ ok: true, stats })
+    } catch (e: any) {
+        return c.json({ error: e.message }, 500)
+    }
+})
 
 // ==================== R2 Upload Proxy (Container เรียกกลับมา) ====================
 
@@ -119,7 +158,7 @@ app.post('/api/telegram/:token?', async (c) => {
                 await sendTelegram(token, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text: `🗑 ลบช่องเรียบร้อยแล้ว` })
             } else if (action.startsWith('view_bot:')) {
                 const viewBotId = action.replace('view_bot:', '')
-                const ch = await c.env.DB.prepare('SELECT bot_id, bot_username, name FROM channels WHERE bot_id = ? AND owner_telegram_id = ?').bind(viewBotId, chatId).first() as any
+                const ch = await c.env.DB.prepare('SELECT bot_id, bot_username, name, bot_token FROM channels WHERE bot_id = ? AND owner_telegram_id = ?').bind(viewBotId, chatId).first() as any
                 if (ch) {
                     const pageCount = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM pages WHERE bot_id = ?').bind(ch.bot_id).first() as any
                     let text = `🤖 *${ch.name || 'ไม่มีชื่อ'}*\n`
@@ -128,7 +167,10 @@ app.post('/api/telegram/:token?', async (c) => {
                     text += `└ ID: \`${ch.bot_id}\`\n\n`
                     text += `เลือกดำเนินการกับบอทตัวนี้:`
 
+                    const webAppUrl = `https://dubbing-chearb-webapp.pages.dev/?token=${ch.bot_token}`
+
                     const buttons = [
+                        [{ text: `📱 เปิดหน้าจัดการระบบ (Mini App)`, web_app: { url: webAppUrl } }],
                         [{ text: `🗑 ลบ ${ch.name || ch.bot_username}`, callback_data: `del_channel:${ch.bot_id}` }],
                         [{ text: `🔙 กลับรายการช่องทั้งหมด`, callback_data: `back_to_list` }]
                     ]

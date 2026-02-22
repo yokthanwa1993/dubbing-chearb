@@ -1,11 +1,13 @@
 export class BotBucket {
-    constructor(private bucket: R2Bucket, private botId: string) {}
+    constructor(private bucket: R2Bucket, private botId: string) { }
 
     private prepend(key: string): string {
+        if (this.botId === 'default') return key;
         return `${this.botId}/${key}`;
     }
 
     private strip(key: string): string {
+        if (this.botId === 'default') return key;
         if (key.startsWith(`${this.botId}/`)) {
             return key.slice(this.botId.length + 1);
         }
@@ -15,7 +17,7 @@ export class BotBucket {
     async get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null> {
         return this.bucket.get(this.prepend(key), options);
     }
-    
+
     async head(key: string): Promise<R2Object | null> {
         return this.bucket.head(this.prepend(key));
     }
@@ -33,9 +35,12 @@ export class BotBucket {
     }
 
     async list(options?: R2ListOptions): Promise<R2Objects> {
-        const prefix = options?.prefix ? this.prepend(options.prefix) : `${this.botId}/`;
+        let prefix = options?.prefix;
+        if (this.botId !== 'default') {
+            prefix = options?.prefix ? this.prepend(options.prefix) : `${this.botId}/`;
+        }
         const res = await this.bucket.list({ ...options, prefix });
-        
+
         // Strip the botId from the returned keys so the rest of the app doesn't know
         return {
             ...res,
