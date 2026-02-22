@@ -1,9 +1,11 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { Container } from '@cloudflare/containers'
+import { BotBucket } from './utils/botBucket'
+import { getBotId } from './utils/botAuth'
 import { type Env, rebuildGalleryCache, updateGalleryCache, sendTelegram, runPipeline, processNextInQueue } from './pipeline'
 
-const app = new Hono<{ Bindings: Env }>()
+const app = new Hono<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>()
 
 // CORS
 app.use('*', async (c, next) => {
@@ -14,6 +16,19 @@ app.use('*', async (c, next) => {
     return corsMiddleware(c, next)
 })
 
+
+app.use('*', async (c, next) => {
+    let token = c.req.header('x-auth-token') || '';
+    if (!token && c.req.path.startsWith('/api/telegram/')) {
+        const parts = c.req.path.split('/');
+        if (parts.length >= 4) token = parts[3];
+    }
+    const botId = getBotId(token);
+    c.set('botId', botId);
+    c.set('bucket', new BotBucket(c.get('bucket'), botId) as unknown as R2Bucket);
+    await next();
+})
+
 // Health check
 app.get('/', (c) => c.json({ status: 'ok', service: 'dubbing-chearb-worker' }))
 
@@ -22,7 +37,7 @@ app.get('/', (c) => c.json({ status: 'ok', service: 'dubbing-chearb-worker' }))
 app.put('/api/r2-upload/:key{.+}', async (c) => {
     // Auth: ใช้ token header ตรวจสอบ
     const authToken = c.req.header('x-auth-token')
-    if (authToken !== c.env.TELEGRAM_BOT_TOKEN) {
+    if (authToken !== (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN)) {
         return c.json({ error: 'unauthorized' }, 401)
     }
 
@@ -30,7 +45,7 @@ app.put('/api/r2-upload/:key{.+}', async (c) => {
     const contentType = c.req.header('content-type') || 'application/octet-stream'
     const body = await c.req.arrayBuffer()
 
-    await c.env.BUCKET.put(key, body, {
+    await c.get('bucket').put(key, body, {
         httpMetadata: { contentType },
     })
 
@@ -39,10 +54,10 @@ app.put('/api/r2-upload/:key{.+}', async (c) => {
 
 app.get('/api/r2-proxy/:key{.+}', async (c) => {
     const authToken = c.req.header('x-auth-token')
-    if (authToken !== c.env.TELEGRAM_BOT_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+    if (authToken !== (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN)) return c.json({ error: 'unauthorized' }, 401)
 
     const key = c.req.param('key')
-    const obj = await c.env.BUCKET.get(key)
+    const obj = await c.get('bucket').get(key)
     if (!obj) return c.json({ error: 'not found' }, 404)
 
     return new Response(obj.body, { headers: { 'Content-Type': obj.httpMetadata?.contentType || 'application/octet-stream' } })
@@ -50,10 +65,10 @@ app.get('/api/r2-proxy/:key{.+}', async (c) => {
 
 app.delete('/api/r2-proxy/:key{.+}', async (c) => {
     const authToken = c.req.header('x-auth-token')
-    if (authToken !== c.env.TELEGRAM_BOT_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+    if (authToken !== (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN)) return c.json({ error: 'unauthorized' }, 401)
 
     const key = c.req.param('key')
-    await c.env.BUCKET.delete(key)
+    await c.get('bucket').delete(key)
     return c.json({ ok: true, key })
 })
 
@@ -69,44 +84,169 @@ async function getCategories(bucket: R2Bucket): Promise<string[]> {
 
 // ==================== TELEGRAM WEBHOOK ====================
 
-app.post('/api/telegram', async (c) => {
-    try {
-        const data = await c.req.json() as {
-            update_id?: number
-            message?: {
-                message_id: number
-                chat: { id: number }
-                text?: string
-                video?: { file_id: string }
-            }
+app.post('/api/telegram/:token?', async (c) => {
+    const data = await c.req.json() as any
+    const msg = data.message
+    const cb = data.callback_query
+    const chatId = msg?.chat?.id || cb?.message?.chat?.id
+    const token = c.req.param('token') || c.req.header('x-auth-token') || (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN)
+    const botId = c.get('botId') || 'default'
+
+    // Verify User Access
+    if (chatId) {
+        const allowedUser = await c.env.DB.prepare('SELECT 1 FROM allowed_users WHERE telegram_id = ?').bind(chatId).first()
+        if (!allowedUser) {
+            console.log('Unauthorized Telegram ID:', chatId)
+            return c.text('ok')
         }
+    } else {
+        return c.text('ok')
+    }
 
-        if (!data?.message) return c.text('ok')
+    // Process Callback Query First
+    if (cb) {
+        const action = cb.data as string
+        if (action.startsWith('add_page:')) {
+            const targetId = action.split(':')[1]
+            const tempObj = await c.get('bucket').get(`_fb_temp/${chatId}.json`)
+            if (tempObj) {
+                const pagesList = await tempObj.json() as any[]
+                const targetPage = pagesList.find(p => p.id === targetId)
+                if (targetPage) {
+                    const imageUrl = targetPage.picture?.data?.url || ''
+                    await c.env.DB.prepare(
+                        'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, name = excluded.name, image_url = excluded.image_url, bot_id = excluded.bot_id'
+                    ).bind(targetPage.id, targetPage.name, imageUrl, targetPage.access_token, botId).run()
+                    await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `✅ *เชื่อมต่อเพจเสร็จสมบูรณ์!*\nเพจ: ${targetPage.name}\n\nระบบจะทำการโพสต์ไปยังเพจนี้ตามคิวที่ตั้งไว้`, parse_mode: 'Markdown' })
+                }
+            }
+            await sendTelegram(token, 'answerCallbackQuery', { callback_query_id: cb.id, text: "เพิ่มข้อมูลสำเร็จ!" }).catch(() => null)
+        }
+        return c.text('ok')
+    }
 
-        const msg = data.message
-        const chatId = msg.chat.id
-        const text = msg.text || ''
-        const token = c.env.TELEGRAM_BOT_TOKEN
+    if (!msg) return c.text('ok')
+    const text = msg.text || ''
+
+    // Telegram UI Configuration Commands (Bot UI)
+    const stateKey = `_user_state/${chatId}.json`
+
+    if (text === '/start' || text === '/menu') {
+        await c.get('bucket').delete(stateKey)
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: '👋 *ระบบโพสต์อัตโนมัติ Dubbing Chearb*\n\n⚙️ *เมนูลัด*\n🔹 /newchannel - เชื่อมต่อเพจ Facebook เข้าบอท\n🔹 /channels - ดูรายการเพจทั้งหมดและจัดการ\n🔹 /status - ดูสถานะการทำงานบอท\n\nสามารถส่งลิงก์วิดีโอเข้าคิวได้เลย!',
+            parse_mode: 'Markdown'
+        })
+        return c.text('ok')
+    }
+
+    if (text === '/newchannel') {
+        await c.get('bucket').put(stateKey, JSON.stringify({ state: 'WAITING_FB_TOKEN' }), { httpMetadata: { contentType: 'application/json' } })
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: '📥 *เพิ่มช่อง Facebook*\n\nกรุณาส่ง *User Access Token* ของ Facebook (ที่ได้จาก Meta for Developers) มาในข้อความถัดไปได้เลยครับผม',
+            parse_mode: 'Markdown'
+        })
+        return c.text('ok')
+    }
+
+    if (text === '/channels') {
+        await c.get('bucket').delete(stateKey)
+        const { results: pages } = await c.env.DB.prepare('SELECT id, name FROM pages WHERE bot_id = ?').bind(botId).all() as any
+        if (pages.length === 0) {
+            await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ ขณะนี้ยังไม่มีช่องใดถูกผูกกับบอทตัวนี้ครับ' })
+            return c.text('ok')
+        }
+        const pageText = pages.map((p: any, i: number) => `${i + 1}. ${p.name}\n(ID: ${p.id})`).join('\n\n')
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: `📄 *ช่องทั้งหมดของคุณ*\n\n${pageText}\n\nพิมพ์ /delchannel <ID> เพื่อลบช่องครับ`,
+            parse_mode: 'Markdown'
+        })
+        return c.text('ok')
+    }
+
+    if (text.startsWith('/delchannel ')) {
+        const delId = text.split(' ')[1]
+        if (delId) {
+            await c.env.DB.prepare('DELETE FROM pages WHERE id = ? AND bot_id = ?').bind(delId, botId).run()
+            await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `🗑 ลบช่อง ID ${delId} เรียบร้อยแล้ว` })
+        }
+        return c.text('ok')
+    }
+
+    if (text === '/status') {
+        const { results: pages } = await c.env.DB.prepare('SELECT id FROM pages WHERE bot_id = ?').bind(botId).all() as any
+        const { results: queued } = await c.env.DB.prepare("SELECT video_id FROM post_queue WHERE status = 'queued' AND bot_id = ?").bind(botId).all() as any
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: `📊 *สถานะบอทของคุณ*\n\n🔗 จำนวนเพจ: ${pages.length}\n⏳ คิวเตรียมโพสต์: ${queued.length}\n\n[แดชบอร์ด WebApp](${c.env.R2_PUBLIC_URL})`,
+            parse_mode: 'Markdown'
+        })
+        return c.text('ok')
+    }
+
+    const stateObj = await c.get('bucket').get(stateKey)
+    if (stateObj) {
+        const state = await stateObj.json() as any
+        if (state.state === 'WAITING_FB_TOKEN' && text && !text.startsWith('/')) {
+            await c.get('bucket').delete(stateKey)
+            const fbToken = text.trim()
+
+            const fbResponse = await fetch(`https://graph.facebook.com/v21.0/me/accounts?fields=id,name,picture.type(large),access_token&access_token=${fbToken}`)
+            if (!fbResponse.ok) {
+                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ Token ไม่ถูกต้องหรือไม่สามารถดึงข้อมูลเพจได้' })
+                return c.text('ok')
+            }
+            const fbData = await fbResponse.json() as any
+            const pagesList = fbData.data || []
+            if (pagesList.length === 0) {
+                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ ไม่พบหน้าเพจที่จัดการได้ในบัญชีนี้' })
+                return c.text('ok')
+            }
+
+            await c.get('bucket').put(`_fb_temp/${chatId}.json`, JSON.stringify(pagesList), { httpMetadata: { contentType: 'application/json' } })
+            const buttons = pagesList.map((p: any) => ([{ text: `➕ ${p.name}`, callback_data: `add_page:${p.id}` }]))
+
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: '✅ *พบเพจเหล่านี้:* เลือกเพจที่ต้องการซิงค์เข้าบอท 👇',
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: buttons }
+            })
+            return c.text('ok')
+        }
+    }
+    // ORIGINAL WEBHOOK CONTINUES HERE
+    // `data` has already been defined, so we just wrap it with try-catch fallback or assign to old variables.
+    // The previous code had:
+    // const data = await c.req.json() ... 
+    // const msg = data.message;
+    // const token = (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN);
+
+    try {
+        // Variables defined upstream
 
         // Dedup: ป้องกัน Telegram retry ขณะ pipeline ยังรันอยู่
         const dedupKey = `_dedup/${data.update_id || msg.message_id}`
-        const existing = await c.env.BUCKET.head(dedupKey)
+        const existing = await c.get('bucket').head(dedupKey)
         if (existing) return c.text('ok')
 
         const pendingShopeeKey = `_pending_shopee/${chatId}.json`
         const pendingCategoryKey = `_pending_category/${chatId}.json`
 
-        const CATEGORIES = await getCategories(c.env.BUCKET)
+        const CATEGORIES = await getCategories(c.get('bucket'))
 
         // กรณีเลือกหมวดหมู่ → บันทึก category
-        const pendingCatObj = await c.env.BUCKET.get(pendingCategoryKey)
+        const pendingCatObj = await c.get('bucket').get(pendingCategoryKey)
         if (pendingCatObj && text.trim() && CATEGORIES.includes(text.trim())) {
             const pending = await pendingCatObj.json() as { videoId: string }
 
             // ตอบ user ก่อนเลย (ไว)
             const [, metaObj] = await Promise.all([
-                c.env.BUCKET.delete(pendingCategoryKey),
-                c.env.BUCKET.get(`videos/${pending.videoId}.json`),
+                c.get('bucket').delete(pendingCategoryKey),
+                c.get('bucket').get(`videos/${pending.videoId}.json`),
                 sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
                     text: '📝 บันทึกหมวดหมู่แล้ว',
@@ -118,10 +258,10 @@ app.post('/api/telegram', async (c) => {
             if (metaObj) {
                 const meta = await metaObj.json() as Record<string, unknown>
                 meta.category = text.trim()
-                await c.env.BUCKET.put(`videos/${pending.videoId}.json`, JSON.stringify(meta, null, 2), {
+                await c.get('bucket').put(`videos/${pending.videoId}.json`, JSON.stringify(meta, null, 2), {
                     httpMetadata: { contentType: 'application/json' },
                 })
-                await updateGalleryCache(c.env.BUCKET, pending.videoId)
+                await updateGalleryCache(c.get('bucket'), pending.videoId)
             }
 
             return c.text('ok')
@@ -130,25 +270,25 @@ app.post('/api/telegram', async (c) => {
         // Helper สำหรับรวมการเซฟวิดีโอที่รอลิงก์ Shopee
         const handleVideoInput = async (videoUrl: string) => {
             const waitingVideoKey = `_waiting_video/${chatId}.json`
-            await c.env.BUCKET.put(waitingVideoKey, JSON.stringify({ videoUrl }), {
+            await c.get('bucket').put(waitingVideoKey, JSON.stringify({ videoUrl }), {
                 httpMetadata: { contentType: 'application/json' },
             })
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
                 text: 'ส่งลิ้ง Shopee มาเลย 🛒',
             })
-            await c.env.BUCKET.put(dedupKey, 'processing')
+            await c.get('bucket').put(dedupKey, 'processing')
         }
 
         const handleExecution = async (shopeeLink: string | null = null) => {
             const waitingVideoKey = `_waiting_video/${chatId}.json`
-            const waitingVideoStr = await c.env.BUCKET.get(waitingVideoKey)
+            const waitingVideoStr = await c.get('bucket').get(waitingVideoKey)
             if (waitingVideoStr) {
                 const { videoUrl } = await waitingVideoStr.json() as { videoUrl: string }
-                await c.env.BUCKET.delete(waitingVideoKey)
+                await c.get('bucket').delete(waitingVideoKey)
 
                 if (shopeeLink) {
-                    await c.env.BUCKET.put(`_waiting_shopee/${chatId}.json`, JSON.stringify({ shopeeLink }), {
+                    await c.get('bucket').put(`_waiting_shopee/${chatId}.json`, JSON.stringify({ shopeeLink }), {
                         httpMetadata: { contentType: 'application/json' },
                     })
                 }
@@ -156,12 +296,12 @@ app.post('/api/telegram', async (c) => {
                 const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
 
                 // เช็คว่ามี pipeline กำลังรันอยู่ไหม
-                const processingList = await c.env.BUCKET.list({ prefix: '_processing/' })
+                const processingList = await c.get('bucket').list({ prefix: '_processing/' })
                 const isRunning = processingList.objects.length > 0
 
                 if (isRunning) {
                     // มีอันกำลังทำอยู่ → เข้าคิวรอ
-                    await c.env.BUCKET.put(`_queue/${videoId}.json`, JSON.stringify({
+                    await c.get('bucket').put(`_queue/${videoId}.json`, JSON.stringify({
                         id: videoId,
                         videoUrl,
                         shopeeLink: shopeeLink || '',
@@ -177,7 +317,7 @@ app.post('/api/telegram', async (c) => {
                     })
                 } else {
                     // ไม่มีอันกำลังทำ → เริ่มเลย
-                    await c.env.BUCKET.put(`_processing/${videoId}.json`, JSON.stringify({
+                    await c.get('bucket').put(`_processing/${videoId}.json`, JSON.stringify({
                         id: videoId,
                         videoUrl,
                         shopeeLink: shopeeLink || '',
@@ -191,7 +331,7 @@ app.post('/api/telegram', async (c) => {
                         chat_id: chatId,
                         text: 'กำลังประมวลผลวีดีโอ ✅',
                     })
-                    c.executionCtx.waitUntil(runPipeline(c.env, videoUrl, chatId, 0, videoId))
+                    c.executionCtx.waitUntil(runPipeline(c.env, videoUrl, chatId, 0, videoId, c.get('botId')))
                 }
                 return true
             }
@@ -232,14 +372,14 @@ app.post('/api/telegram', async (c) => {
             let publicUrl = ''
 
             // fallback: ใช้ cache หาวีดีโอล่าสุดที่ยังไม่มี shopeeLink (ย้อนหลัง)
-            const pendingObj = await c.env.BUCKET.get(pendingShopeeKey)
+            const pendingObj = await c.get('bucket').get(pendingShopeeKey)
             if (pendingObj) {
                 const pending = await pendingObj.json() as { videoId: string; publicUrl: string; msgId?: number }
                 videoId = pending.videoId
                 publicUrl = pending.publicUrl
-                await c.env.BUCKET.delete(pendingShopeeKey)
+                await c.get('bucket').delete(pendingShopeeKey)
             } else {
-                const cacheObj = await c.env.BUCKET.get('_cache/gallery.json')
+                const cacheObj = await c.get('bucket').get('_cache/gallery.json')
                 if (cacheObj) {
                     const cache = await cacheObj.json() as { videos: Record<string, unknown>[] }
                     const found = (cache.videos || []).find(v => !v.shopeeLink)
@@ -259,12 +399,12 @@ app.post('/api/telegram', async (c) => {
             }
 
             // อัพเดท metadata ลิงก์ย้อนหลัง + ตอบ user พร้อมกัน
-            const metaObj2 = await c.env.BUCKET.get(`videos/${videoId}.json`)
+            const metaObj2 = await c.get('bucket').get(`videos/${videoId}.json`)
             if (metaObj2) {
                 const meta = await metaObj2.json() as Record<string, unknown>
                 meta.shopeeLink = shopeeLink
                 await Promise.all([
-                    c.env.BUCKET.put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+                    c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
                         httpMetadata: { contentType: 'application/json' },
                     }),
                     sendTelegram(token, 'sendMessage', {
@@ -272,7 +412,7 @@ app.post('/api/telegram', async (c) => {
                         text: '✅ บันทึกลิงก์ Shopee ให้วิดีโอรายการล่าสุดย้อนหลังเรียบร้อยแล้ว',
                     }),
                 ])
-                await updateGalleryCache(c.env.BUCKET, videoId)
+                await updateGalleryCache(c.get('bucket'), videoId)
             }
 
             return c.text('ok')
@@ -300,7 +440,7 @@ app.post('/api/telegram', async (c) => {
 
         // ข้อความอื่น
         if (text.trim()) {
-            const hasPending = await c.env.BUCKET.head(pendingShopeeKey)
+            const hasPending = await c.get('bucket').head(pendingShopeeKey)
             if (hasPending) {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
@@ -323,9 +463,9 @@ app.post('/api/telegram', async (c) => {
 
 // ล้าง dedup keys (กรณีค้าง)
 app.delete('/api/dedup', async (c) => {
-    const list = await c.env.BUCKET.list({ prefix: '_dedup/' })
+    const list = await c.get('bucket').list({ prefix: '_dedup/' })
     for (const obj of list.objects) {
-        await c.env.BUCKET.delete(obj.key)
+        await c.get('bucket').delete(obj.key)
     }
     return c.json({ deleted: list.objects.length })
 })
@@ -334,10 +474,10 @@ app.delete('/api/dedup', async (c) => {
 
 app.get('/api/processing', async (c) => {
     try {
-        const list = await c.env.BUCKET.list({ prefix: '_processing/' })
+        const list = await c.get('bucket').list({ prefix: '_processing/' })
         const tasks = await Promise.all(
             list.objects.map(async obj => {
-                const data = await c.env.BUCKET.get(obj.key)
+                const data = await c.get('bucket').get(obj.key)
                 if (data) return await data.json()
                 return null
             })
@@ -352,8 +492,8 @@ app.get('/api/processing', async (c) => {
 
 app.delete('/api/processing/:id', async (c) => {
     try {
-        await c.env.BUCKET.delete(`_processing/${c.req.param('id')}.json`)
-        c.executionCtx.waitUntil(processNextInQueue(c.env))
+        await c.get('bucket').delete(`_processing/${c.req.param('id')}.json`)
+        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -363,10 +503,10 @@ app.delete('/api/processing/:id', async (c) => {
 // Refresh gallery cache for a specific video (called by container after pipeline completes)
 app.post('/api/gallery/refresh/:id', async (c) => {
     try {
-        await updateGalleryCache(c.env.BUCKET, c.req.param('id'))
+        await updateGalleryCache(c.get('bucket'), c.req.param('id'))
 
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
-        c.executionCtx.waitUntil(processNextInQueue(c.env))
+        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
 
         return c.json({ ok: true })
     } catch (e) {
@@ -377,7 +517,7 @@ app.post('/api/gallery/refresh/:id', async (c) => {
 // Process next queued job
 app.post('/api/queue/next', async (c) => {
     try {
-        const started = await processNextInQueue(c.env)
+        const started = await processNextInQueue(c.env, c.get('botId'))
         return c.json({ ok: true, started })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -387,10 +527,10 @@ app.post('/api/queue/next', async (c) => {
 // Get queue items
 app.get('/api/queue', async (c) => {
     try {
-        const list = await c.env.BUCKET.list({ prefix: '_queue/' })
+        const list = await c.get('bucket').list({ prefix: '_queue/' })
         const items = []
         for (const obj of list.objects) {
-            const data = await c.env.BUCKET.get(obj.key)
+            const data = await c.get('bucket').get(obj.key)
             if (data) items.push(await data.json())
         }
         return c.json({ queue: items })
@@ -402,8 +542,8 @@ app.get('/api/queue', async (c) => {
 // Delete queue item
 app.delete('/api/queue/:id', async (c) => {
     try {
-        await c.env.BUCKET.delete(`_queue/${c.req.param('id')}.json`)
-        c.executionCtx.waitUntil(processNextInQueue(c.env))
+        await c.get('bucket').delete(`_queue/${c.req.param('id')}.json`)
+        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -413,13 +553,13 @@ app.delete('/api/queue/:id', async (c) => {
 // ==================== CATEGORIES API ====================
 
 app.get('/api/categories', async (c) => {
-    const cats = await getCategories(c.env.BUCKET)
+    const cats = await getCategories(c.get('bucket'))
     return c.json({ categories: cats })
 })
 
 app.put('/api/categories', async (c) => {
     const body = await c.req.json() as { categories: string[] }
-    await c.env.BUCKET.put('_config/categories.json', JSON.stringify(body.categories), {
+    await c.get('bucket').put('_config/categories.json', JSON.stringify(body.categories), {
         httpMetadata: { contentType: 'application/json' },
     })
     return c.json({ success: true })
@@ -430,14 +570,14 @@ app.put('/api/categories', async (c) => {
 app.get('/api/gallery', async (c) => {
     try {
         // อ่านจาก cache file เดียว (เร็วกว่าอ่านทีละไฟล์มาก)
-        const cached = await c.env.BUCKET.get('_cache/gallery.json')
+        const cached = await c.get('bucket').get('_cache/gallery.json')
         if (cached) {
             const data = await cached.json()
             return c.json(data, 200, { 'Cache-Control': 'public, max-age=30, stale-while-revalidate=60' })
         }
 
         // ถ้ายังไม่มี cache → สร้างใหม่
-        const videos = await rebuildGalleryCache(c.env.BUCKET)
+        const videos = await rebuildGalleryCache(c.get('bucket'))
         return c.json({ videos })
     } catch (e) {
         return c.json({ videos: [], error: String(e) })
@@ -461,7 +601,7 @@ app.get('/api/gallery/used', async (c) => {
         // Get video metadata for each posted video
         const videos: unknown[] = []
         for (const videoId of postedIds) {
-            const metaObj = await c.env.BUCKET.get(`videos/${videoId}.json`)
+            const metaObj = await c.get('bucket').get(`videos/${videoId}.json`)
             if (metaObj) {
                 const meta = await metaObj.json()
                 videos.push(meta)
@@ -483,16 +623,16 @@ app.put('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {
         const body = await c.req.json() as { shopeeLink?: string; category?: string; title?: string }
-        const metaObj = await c.env.BUCKET.get(`videos/${id}.json`)
+        const metaObj = await c.get('bucket').get(`videos/${id}.json`)
         if (!metaObj) return c.json({ error: 'Video not found' }, 404)
         const meta = await metaObj.json() as Record<string, unknown>
         if (body.shopeeLink !== undefined) meta.shopeeLink = body.shopeeLink
         if (body.category !== undefined) meta.category = body.category
         if (body.title !== undefined) meta.title = body.title
-        await c.env.BUCKET.put(`videos/${id}.json`, JSON.stringify(meta, null, 2), {
+        await c.get('bucket').put(`videos/${id}.json`, JSON.stringify(meta, null, 2), {
             httpMetadata: { contentType: 'application/json' },
         })
-        await updateGalleryCache(c.env.BUCKET, id)
+        await updateGalleryCache(c.get('bucket'), id)
         return c.json({ success: true })
     } catch {
         return c.json({ error: 'Failed to update video' }, 500)
@@ -503,12 +643,12 @@ app.delete('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {
         // Delete video files + metadata from R2
-        await c.env.BUCKET.delete(`videos/${id}.json`)
-        await c.env.BUCKET.delete(`videos/${id}.mp4`)
-        await c.env.BUCKET.delete(`videos/${id}_original.mp4`)
-        await c.env.BUCKET.delete(`videos/${id}_thumb.webp`)
+        await c.get('bucket').delete(`videos/${id}.json`)
+        await c.get('bucket').delete(`videos/${id}.mp4`)
+        await c.get('bucket').delete(`videos/${id}_original.mp4`)
+        await c.get('bucket').delete(`videos/${id}_thumb.webp`)
         // Rebuild gallery cache
-        await rebuildGalleryCache(c.env.BUCKET)
+        await rebuildGalleryCache(c.get('bucket'))
         return c.json({ success: true })
     } catch {
         return c.json({ error: 'Failed to delete video' }, 500)
@@ -518,7 +658,7 @@ app.delete('/api/gallery/:id', async (c) => {
 app.get('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {
-        const metaObj = await c.env.BUCKET.get(`videos/${id}.json`)
+        const metaObj = await c.get('bucket').get(`videos/${id}.json`)
         if (!metaObj) return c.json({ error: 'ไม่พบวิดีโอ' }, 404)
         const metadata = await metaObj.json()
         return c.json(metadata)
@@ -533,8 +673,8 @@ app.get('/api/gallery/:id', async (c) => {
 app.get('/api/pages', async (c) => {
     try {
         const { results } = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, comment_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at FROM pages ORDER BY created_at DESC'
-        ).all()
+            'SELECT id, name, image_url, access_token, comment_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+        ).bind(c.get('botId')).all()
         return c.json({ pages: results })
     } catch (e) {
         return c.json({ error: 'Failed to fetch pages' }, 500)
@@ -562,8 +702,8 @@ app.post('/api/pages', async (c) => {
         const { id, name, image_url, access_token, post_interval_minutes = 60 } = body
 
         await c.env.DB.prepare(
-            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes) VALUES (?, ?, ?, ?, ?)'
-        ).bind(id, name, image_url, access_token, post_interval_minutes).run()
+            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, bot_id) VALUES (?, ?, ?, ?, ?, ?)'
+        ).bind(id, name, image_url, access_token, post_interval_minutes, c.get('botId')).run()
 
         return c.json({ success: true, id })
     } catch (e) {
@@ -670,8 +810,8 @@ app.post('/api/pages/import', async (c) => {
                 skipped.push({ id: pageId, name: pageName, reason: 'updated' })
             } else {
                 await c.env.DB.prepare(
-                    'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active) VALUES (?, ?, ?, ?, 60, 1)'
-                ).bind(pageId, pageName, pageImageUrl, pageAccessToken).run()
+                    'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?)'
+                ).bind(pageId, pageName, pageImageUrl, pageAccessToken, c.get('botId')).run()
                 imported.push({ id: pageId, name: pageName })
             }
         }
@@ -708,8 +848,8 @@ app.post('/api/pages/:id/queue', async (c) => {
         const { video_id, scheduled_at } = body
 
         await c.env.DB.prepare(
-            'INSERT INTO post_queue (video_id, page_id, scheduled_at) VALUES (?, ?, ?)'
-        ).bind(video_id, pageId, scheduled_at).run()
+            'INSERT INTO post_queue (video_id, page_id, scheduled_at, bot_id) VALUES (?, ?, ?, ?)'
+        ).bind(video_id, pageId, scheduled_at, c.get('botId')).run()
 
         return c.json({ success: true })
     } catch (e) {
@@ -911,17 +1051,17 @@ script: ${script}`
 
 // Rebuild gallery cache
 app.post('/api/rebuild-cache', async (c) => {
-    const videos = await rebuildGalleryCache(c.env.BUCKET)
+    const videos = await rebuildGalleryCache(c.get('bucket'))
     return c.json({ rebuilt: true, count: videos.length })
 })
 
 // List videos needing titles
 app.get('/api/generate-titles/pending', async (c) => {
-    const videoList = await c.env.BUCKET.list({ prefix: 'videos/' })
+    const videoList = await c.get('bucket').list({ prefix: 'videos/' })
     const pending: Array<{ id: string; currentTitle: string }> = []
     for (const file of videoList.objects) {
         if (!file.key.endsWith('.json')) continue
-        const obj = await c.env.BUCKET.get(file.key)
+        const obj = await c.get('bucket').get(file.key)
         if (!obj) continue
         const meta = await obj.json() as Record<string, unknown>
         if (!meta.script) continue
@@ -942,8 +1082,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const skipComment = body.skipComment === true
         // Get page info
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, comment_token, post_hours FROM pages WHERE id = ?'
-        ).bind(pageId).first() as { id: string; name: string; access_token: string; comment_token: string | null; post_hours: string } | null
+            'SELECT id, name, access_token, comment_token, post_hours FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(pageId, c.get('botId')).first() as { id: string; name: string; access_token: string; comment_token: string | null; post_hours: string } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
 
@@ -971,9 +1111,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Randomly select one video
         const unpostedId = unpostedVideos[Math.floor(Math.random() * unpostedVideos.length)]
 
-        const metaObj = await env.BUCKET.get(`videos/${unpostedId}.json`)
+        const metaObj = await c.get('bucket').get(`videos/${unpostedId}.json`)
         if (!metaObj) return c.json({ error: 'Video metadata not found' }, 404)
-        const meta = await metaObj.json() as { publicUrl: string; script?: string; title?: string; shopeeLink?: string }
+        const meta = await metaObj.json() as { publicUrl: string; script?: string; title?: string; shopeeLink?: string; category?: string }
 
         // Use title if available, otherwise generate caption from script
         const apiKey = env.GOOGLE_API_KEY
@@ -1281,7 +1421,7 @@ async function handleScheduled(env: Env) {
 
     // 1. Get active pages with their post_hours
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, comment_token, post_hours, last_post_at
+        SELECT id, name, access_token, comment_token, post_hours, last_post_at, bot_id
         FROM pages
         WHERE is_active = 1 AND post_hours IS NOT NULL AND post_hours != ''
     `).all() as {
@@ -1292,6 +1432,7 @@ async function handleScheduled(env: Env) {
             comment_token: string | null
             post_hours: string
             last_post_at: string | null
+            bot_id: string | null
         }>
     }
 
@@ -1301,6 +1442,8 @@ async function handleScheduled(env: Env) {
     console.log(`[CRON] Found ${pages.length} active pages, Thai time: ${thaiHour}:${thaiMinute.toString().padStart(2, '0')} (${nowMinutes}m), date: ${todayStr}`)
 
     for (const page of pages) {
+        const botId = page.bot_id || 'default';
+        const botBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket;
         // Parse scheduled times
         const scheduledTimes = page.post_hours.split(',').map(part => {
             const trimmed = part.trim()
@@ -1352,20 +1495,20 @@ async function handleScheduled(env: Env) {
 
         // CRITICAL: Atomic dedup using R2 (prevents concurrent cron executions from double-posting)
         const dedupKey = `_cron_dedup/${page.id}/${todayStr}/${matchedSlot.hour}_${matchedSlot.minute}`
-        const existingDedup = await env.BUCKET.head(dedupKey)
+        const existingDedup = await botBucket.head(dedupKey)
         if (existingDedup) {
             console.log(`[CRON] Page ${page.name}: already posted for this slot (dedup key exists)`)
             continue
         }
         // Set dedup key immediately (before any async operations) - TTL 24 hours
-        await env.BUCKET.put(dedupKey, nowISO, {
+        await botBucket.put(dedupKey, nowISO, {
             httpMetadata: { contentType: 'text/plain' },
             customMetadata: { createdAt: nowISO }
         })
 
         // 2. Get a video that hasn't been posted to this page yet
         // First, get all video IDs from R2
-        const videoList = await env.BUCKET.list({ prefix: 'videos/' })
+        const videoList = await botBucket.list({ prefix: 'videos/' })
         const allVideoIds: string[] = []
         for (const obj of videoList.objects) {
             if (obj.key.endsWith('.json')) {
@@ -1376,7 +1519,7 @@ async function handleScheduled(env: Env) {
 
         if (allVideoIds.length === 0) {
             console.log(`[CRON] No videos available`)
-            await env.BUCKET.delete(dedupKey).catch(() => { }) // Clean up dedup key
+            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
             continue
         }
 
@@ -1391,24 +1534,24 @@ async function handleScheduled(env: Env) {
         const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
         if (unpostedVideos.length === 0) {
             console.log(`[CRON] Page ${page.name}: no unposted videos`)
-            await env.BUCKET.delete(dedupKey).catch(() => { }) // Clean up dedup key
+            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
             continue
         }
         // Randomly select one video
         const unpostedId = unpostedVideos[Math.floor(Math.random() * unpostedVideos.length)]
         if (!unpostedId) {
             console.log(`[CRON] Page ${page.name}: no unposted videos`)
-            await env.BUCKET.delete(dedupKey).catch(() => { }) // Clean up dedup key
+            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
             continue
         }
 
         // Get video metadata
-        const metaObj = await env.BUCKET.get(`videos/${unpostedId}.json`)
+        const metaObj = await botBucket.get(`videos/${unpostedId}.json`)
         if (!metaObj) {
-            await env.BUCKET.delete(dedupKey).catch(() => { }) // Clean up dedup key
+            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
             continue
         }
-        const meta = await metaObj.json() as { publicUrl: string; script?: string; title?: string; shopeeLink?: string }
+        const meta = await metaObj.json() as { publicUrl: string; script?: string; title?: string; shopeeLink?: string; category?: string }
 
         // Generate short caption from script (no Shopee link)
         const apiKey = env.GOOGLE_API_KEY
@@ -1538,7 +1681,7 @@ async function handleScheduled(env: Env) {
             ).bind(errorMsg, page.id, unpostedId).run()
 
             // Clean up dedup key to allow retry in next cron cycle
-            await env.BUCKET.delete(dedupKey).catch(() => { })
+            await botBucket.delete(dedupKey).catch(() => { })
         }
     }
 
@@ -1611,7 +1754,7 @@ async function watchdogStuckJobs(env: Env) {
         }
 
         // ลบ processing ค้างทั้งหมดแล้ว → ลองเริ่มอันถัดไปในคิว
-        await processNextInQueue(env)
+        await processNextInQueue(env, 'default')
     } catch (e) {
         console.error('[WATCHDOG] Error:', e instanceof Error ? e.message : String(e))
     }
