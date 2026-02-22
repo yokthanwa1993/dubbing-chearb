@@ -94,13 +94,17 @@ app.post('/api/telegram/:token?', async (c) => {
 
     if (!chatId) return c.text('ok')
 
+    console.log('[WEBHOOK] chatId:', chatId, 'token:', token?.substring(0, 15), 'botId:', botId, 'isParam:', c.req.param('token')?.substring(0, 15))
+
     // Check if this token belongs to a registered Channel Bot
     const isChannelBot = await c.env.DB.prepare('SELECT 1 FROM channels WHERE bot_token = ?').bind(token).first()
+    console.log('[WEBHOOK] isChannelBot:', !!isChannelBot)
 
     // ==================== SETTING BOT (ไม่ใช่ Channel Bot) ====================
     if (!isChannelBot) {
         // Verify allowed user
         const allowedUser = await c.env.DB.prepare('SELECT 1 FROM allowed_users WHERE telegram_id = ?').bind(chatId).first()
+        console.log('[SETTING] allowedUser:', !!allowedUser, 'text:', msg?.text)
         if (!allowedUser) return c.text('ok')
 
         const stateKey = `_setting_state/${chatId}.json`
@@ -124,11 +128,20 @@ app.post('/api/telegram/:token?', async (c) => {
         // /start
         if (text === '/start' || text === '/menu') {
             await c.env.BUCKET.delete(stateKey).catch(() => { })
-            await sendTelegram(token, 'sendMessage', {
+            console.log('[SETTING] /start from', chatId, 'token:', token?.substring(0, 10) + '...')
+            const result = await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: '⚙️ *Dubbing Chearb — ตั้งค่าช่อง*\n\n📋 *คำสั่ง*\n🔹 /newchannel — เพิ่มช่องใหม่ (ส่ง Bot Token)\n🔹 /channels — ดูช่องทั้งหมดของคุณ\n\n1 ช่อง = 1 บอท Telegram\nแต่ละช่องมีแดชบอร์ดและเพจแยกกัน',
+                text: `⚙️ *Dubbing Chearb — ตั้งค่าช่อง*
+
+📋 *คำสั่ง*
+🔹 /newchannel — เพิ่มช่องใหม่ (ส่ง Bot Token)
+🔹 /mychannel — ดูช่องทั้งหมดของคุณ
+
+1 ช่อง = 1 บอท Telegram
+แต่ละช่องมีแดชบอร์ดและเพจแยกกัน`,
                 parse_mode: 'Markdown'
             })
+            console.log('[SETTING] sendTelegram result:', JSON.stringify(result))
             return c.text('ok')
         }
 
@@ -143,8 +156,8 @@ app.post('/api/telegram/:token?', async (c) => {
             return c.text('ok')
         }
 
-        // /channels
-        if (text === '/channels') {
+        // /mychannel
+        if (text === '/mychannel') {
             await c.env.BUCKET.delete(stateKey).catch(() => { })
             const { results: channels } = await c.env.DB.prepare(
                 'SELECT bot_id, bot_username, name, created_at FROM channels WHERE owner_telegram_id = ? ORDER BY created_at DESC'
