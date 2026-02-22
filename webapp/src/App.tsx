@@ -3,14 +3,14 @@ import { useEffect, useState } from 'react'
 
 const getToken = () => localStorage.getItem('bot_token') || '';
 const setToken = (t: string) => {
-    if (t) localStorage.setItem('bot_token', t.trim());
-    else localStorage.removeItem('bot_token');
-    window.location.reload();
+  if (t) localStorage.setItem('bot_token', t.trim());
+  else localStorage.removeItem('bot_token');
+  window.location.reload();
 };
 
 const apiFetch = async (url: string, options: RequestInit = {}) => {
-    const headers = { ...options.headers, 'x-auth-token': getToken() };
-    return fetch(url, { ...options, headers });
+  const headers = { ...options.headers, 'x-auth-token': getToken() };
+  return fetch(url, { ...options, headers });
 };
 
 const WORKER_URL = 'https://dubbing-chearb-worker.yokthanwa1993-bc9.workers.dev'
@@ -838,40 +838,21 @@ function ProcessingCard({ video, onCancel }: { video: any, onCancel: (id: string
 function App() {
 
   const [token] = useState(() => {
-    try { return localStorage.getItem('bot_token') || '' } catch { return '' }
+    try {
+      const urlParams = new URL(window.location.href).searchParams;
+      const queryToken = urlParams.get('token') || urlParams.get('bot_token');
+      if (queryToken) {
+        localStorage.setItem('bot_token', queryToken.trim());
+        const url = new URL(window.location.href);
+        url.searchParams.delete('token');
+        url.searchParams.delete('bot_token');
+        window.history.replaceState({}, document.title, url.toString());
+        return queryToken.trim();
+      }
+      return localStorage.getItem('bot_token') || ''
+    } catch { return '' }
   });
   const [loginInput, setLoginInput] = useState('');
-
-  if (!token) {
-    return (
-      <div className="h-screen bg-white flex flex-col items-center justify-center p-6 text-center font-['Sukhumvit_Set','Kanit',sans-serif]">
-        <div className="w-20 h-20 bg-blue-50 text-blue-500 rounded-3xl flex items-center justify-center mb-6 shadow-sm">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        </div>
-        <h1 className="text-2xl font-extrabold text-gray-900 mb-2">Login Bot Workspace</h1>
-        <p className="text-sm text-gray-500 mb-8 max-w-[280px]">กรุณาใส่ Telegram Bot Token ประจำพื้นที่ทำงานของคุณ</p>
-        
-        <div className="w-full max-w-sm">
-          <input 
-            type="text" 
-            value={loginInput}
-            onChange={(e) => setLoginInput(e.target.value)}
-            placeholder="e.g. 123456789:AAH..."
-            className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-5 py-4 text-sm font-mono outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all text-center mb-4"
-          />
-          <button 
-            onClick={() => {
-                if (loginInput.trim()) setToken(loginInput.trim());
-            }}
-            disabled={!loginInput.trim()}
-            className="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl active:scale-95 transition-all disabled:bg-gray-300 shadow-md shadow-blue-200"
-          >
-            ต่อไป
-          </button>
-        </div>
-      </div>
-    );
-  }
   const [stats, setStats] = useState<Stats>({ total: 0, completed: 0, processing: 0, failed: 0 })
   const [postHistory, setPostHistory] = useState<PostHistory[]>([])
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
@@ -919,7 +900,8 @@ function App() {
     if (tabParam === 'processing' || tabParam === 'gallery' || tabParam === 'logs' || tabParam === 'pages' || tabParam === 'settings') {
       return tabParam as 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'
     }
-    return 'home'
+    const hasToken = !!(localStorage.getItem('bot_token') || params.get('token') || params.get('bot_token'))
+    return hasToken ? 'home' : 'settings'
   }
 
   const [tab, setTab] = useState<'home' | 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'>(getInitialTab())
@@ -1475,74 +1457,102 @@ function App() {
 
         {tab === 'settings' && (
           <div className="px-5 space-y-6">
-            {user && (
-              <div className="flex items-center p-4 bg-gray-50 rounded-3xl border border-gray-100">
-                <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-2xl font-bold shadow-lg">
-                  {user.first_name?.charAt(0) || 'U'}
+            {!token ? (
+              <div className="bg-white flex flex-col items-center justify-center p-6 text-center rounded-3xl border border-gray-100 mt-10">
+                <div className="w-16 h-16 bg-blue-50 text-blue-500 rounded-3xl flex items-center justify-center mb-4 shadow-sm">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
                 </div>
-                <div className="ml-4">
-                  <h3 className="font-bold text-gray-900 text-lg">{user.first_name} {user.last_name}</h3>
-                  <p className="text-blue-500 font-medium text-xs bg-blue-50 px-2 py-0.5 rounded-md inline-block mt-1">Premium Member</p>
-                </div>
-              </div>
-            )}
-
-            {/* Category Management */}
-            <div className="space-y-3">
-              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider ml-2">หมวดหมู่วีดีโอ</h4>
-              <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
-                {categories.map((cat) => (
-                  <div key={cat} className="flex items-center justify-between">
-                    <span className="text-sm font-medium text-gray-900">#{cat}</span>
-                    <button
-                      onClick={() => saveCategories(categories.filter(c => c !== cat))}
-                      className="w-8 h-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center active:scale-90 transition-transform"
-                    >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                  </div>
-                ))}
-                <div className="flex gap-2 pt-1">
+                <h1 className="text-xl font-extrabold text-gray-900 mb-2">Bot Settings</h1>
+                <p className="text-sm text-gray-500 mb-6 max-w-[280px]">กรุณาใส่ Telegram Bot Token ประจำพื้นที่ทำงานของคุณ</p>
+                <div className="w-full">
                   <input
                     type="text"
-                    value={newCat}
-                    onChange={(e) => setNewCat(e.target.value)}
-                    placeholder="เพิ่มหมวดหมู่ใหม่"
-                    className="flex-1 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                    value={loginInput}
+                    onChange={(e) => setLoginInput(e.target.value)}
+                    placeholder="e.g. 123456789:AAH..."
+                    className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-5 py-4 text-sm font-mono outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all text-center mb-4"
                   />
                   <button
                     onClick={() => {
-                      if (newCat.trim() && !categories.includes(newCat.trim())) {
-                        saveCategories([...categories, newCat.trim()])
-                        setNewCat('')
-                      }
+                      if (loginInput.trim()) setToken(loginInput.trim());
                     }}
-                    disabled={!newCat.trim()}
-                    className="bg-gray-900 text-white px-4 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-30"
+                    disabled={!loginInput.trim()}
+                    className="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl active:scale-95 transition-all disabled:bg-gray-300 shadow-md shadow-blue-200"
                   >
-                    เพิ่ม
+                    เชื่อมต่อ Telegram Bot
                   </button>
                 </div>
               </div>
-            </div>
+            ) : (
+              <>
+                {user && (
+                  <div className="flex items-center p-4 bg-gray-50 rounded-3xl border border-gray-100">
+                    <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-2xl font-bold shadow-lg">
+                      {user.first_name?.charAt(0) || 'U'}
+                    </div>
+                    <div className="ml-4">
+                      <h3 className="font-bold text-gray-900 text-lg">{user.first_name} {user.last_name}</h3>
+                      <p className="text-blue-500 font-medium text-xs bg-blue-50 px-2 py-0.5 rounded-md inline-block mt-1">Premium Member</p>
+                    </div>
+                  </div>
+                )}
 
-            <div className="flex justify-center pt-8">
-              
-            {/* Logout Bot */}
-            <div className="pt-2">
-              <button 
-                 onClick={() => setToken('')}
-                 className="w-full bg-red-50 text-red-600 border border-red-100 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 active:scale-95 transition-transform"
-              >
-                  <span>Switch Bot</span>
-                  <span className="text-[10px] text-red-400 font-mono font-normal">Token: {token.slice(0,10)}...</span>
-              </button>
-            </div>
+                {/* Category Management */}
+                <div className="space-y-3">
+                  <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider ml-2">หมวดหมู่วีดีโอ</h4>
+                  <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                    {categories.map((cat) => (
+                      <div key={cat} className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-gray-900">#{cat}</span>
+                        <button
+                          onClick={() => saveCategories(categories.filter(c => c !== cat))}
+                          className="w-8 h-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center active:scale-90 transition-transform"
+                        >
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
+                    <div className="flex gap-2 pt-1">
+                      <input
+                        type="text"
+                        value={newCat}
+                        onChange={(e) => setNewCat(e.target.value)}
+                        placeholder="เพิ่มหมวดหมู่ใหม่"
+                        className="flex-1 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                      />
+                      <button
+                        onClick={() => {
+                          if (newCat.trim() && !categories.includes(newCat.trim())) {
+                            saveCategories([...categories, newCat.trim()])
+                            setNewCat('')
+                          }
+                        }}
+                        disabled={!newCat.trim()}
+                        className="bg-gray-900 text-white px-4 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-30"
+                      >
+                        เพิ่ม
+                      </button>
+                    </div>
+                  </div>
+                </div>
 
-<p className="text-gray-300 text-xs font-medium">Version 2.0.1 (Build 240)</p>
-            </div>
+                <div className="flex flex-col items-center justify-center pt-8">
+                  {/* Logout Bot */}
+                  <div className="w-full pt-2 mb-4">
+                    <button
+                      onClick={() => setToken('')}
+                      className="w-full bg-red-50 text-red-600 border border-red-100 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 active:scale-95 transition-transform"
+                    >
+                      <span>Switch Bot</span>
+                      <span className="text-[10px] text-red-400 font-mono font-normal">Token: {token.slice(0, 10)}...</span>
+                    </button>
+                  </div>
+                  <p className="text-gray-300 text-xs font-medium">Version 2.0.1 (Build 240)</p>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>
