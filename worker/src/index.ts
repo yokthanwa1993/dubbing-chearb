@@ -25,7 +25,7 @@ app.use('*', async (c, next) => {
     }
     const botId = getBotId(token);
     c.set('botId', botId);
-    c.set('bucket', new BotBucket(c.get('bucket'), botId) as unknown as R2Bucket);
+    c.set('bucket', new BotBucket(c.env.BUCKET, botId) as unknown as R2Bucket);
     await next();
 })
 

@@ -3,7 +3,6 @@
  * ffmpeg merge รันใน Cloudflare Container
  */
 
-import { BotBucket } from './utils/botBucket';
 import { BotBucket } from './utils/botBucket'
 
 export type Env = {
@@ -516,6 +515,7 @@ export async function runPipeline(
 
 /** เช็คคิวและเริ่มทำอันถัดไป (ถ้ามี) */
 export async function processNextInQueue(env: Env, botId: string): Promise<boolean> {
+    const botBucket = new BotBucket(env.BUCKET, botId)
     // เช็คว่ายังมี pipeline กำลังรันอยู่ไหม
     const processingList = await botBucket.list({ prefix: '_processing/' })
     if (processingList.objects.length > 0) {
