@@ -1,5 +1,18 @@
 import { useEffect, useState } from 'react'
 
+
+const getToken = () => localStorage.getItem('bot_token') || '';
+const setToken = (t: string) => {
+    if (t) localStorage.setItem('bot_token', t.trim());
+    else localStorage.removeItem('bot_token');
+    window.location.reload();
+};
+
+const apiFetch = async (url: string, options: RequestInit = {}) => {
+    const headers = { ...options.headers, 'x-auth-token': getToken() };
+    return fetch(url, { ...options, headers });
+};
+
 const WORKER_URL = 'https://dubbing-chearb-worker.yokthanwa1993-bc9.workers.dev'
 
 interface Stats {
@@ -179,7 +192,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   useEffect(() => {
     if (expanded) {
       setLocalCats(video.category ? video.category.split(',').filter(Boolean) : [])
-      fetch(`${WORKER_URL}/api/categories`).then(r => r.json()).then(d => setFetchedCats(d.categories || [])).catch(() => { })
+      apiFetch(`${WORKER_URL}/api/categories`).then(r => r.json()).then(d => setFetchedCats(d.categories || [])).catch(() => { })
     }
   }, [expanded])
 
@@ -188,7 +201,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
     setLocalCats(next)
     const newCat = next.join(',')
     onUpdate(video.id, { category: newCat })
-    await fetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+    await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ category: newCat })
@@ -199,7 +212,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
     if (!shopeeInput.trim()) return
     setSavingShopee(true)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shopeeLink: shopeeInput.trim() })
@@ -219,7 +232,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   const handleSaveTitle = async (newTitle: string) => {
     setSavingTitle(true)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTitle })
@@ -240,7 +253,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
     if (!confirm('ยืนยันลบวีดีโอนี้?')) return
     setDeleting(true)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/gallery/${video.id}`, { method: 'DELETE' })
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, { method: 'DELETE' })
       if (resp.ok) {
         try { localStorage.removeItem(`t_${video.id}`) } catch { }
         onDelete(video.id)
@@ -457,7 +470,7 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
     setError('')
 
     try {
-      const resp = await fetch(`${WORKER_URL}/api/pages/import`, {
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_token: token.trim() })
@@ -597,7 +610,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const handleSave = async () => {
     setSaving(true)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/pages/${page.id}`, {
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/${page.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -823,6 +836,42 @@ function ProcessingCard({ video, onCancel }: { video: any, onCancel: (id: string
 }
 
 function App() {
+
+  const [token] = useState(() => {
+    try { return localStorage.getItem('bot_token') || '' } catch { return '' }
+  });
+  const [loginInput, setLoginInput] = useState('');
+
+  if (!token) {
+    return (
+      <div className="h-screen bg-white flex flex-col items-center justify-center p-6 text-center font-['Sukhumvit_Set','Kanit',sans-serif]">
+        <div className="w-20 h-20 bg-blue-50 text-blue-500 rounded-3xl flex items-center justify-center mb-6 shadow-sm">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </div>
+        <h1 className="text-2xl font-extrabold text-gray-900 mb-2">Login Bot Workspace</h1>
+        <p className="text-sm text-gray-500 mb-8 max-w-[280px]">กรุณาใส่ Telegram Bot Token ประจำพื้นที่ทำงานของคุณ</p>
+        
+        <div className="w-full max-w-sm">
+          <input 
+            type="text" 
+            value={loginInput}
+            onChange={(e) => setLoginInput(e.target.value)}
+            placeholder="e.g. 123456789:AAH..."
+            className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-5 py-4 text-sm font-mono outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all text-center mb-4"
+          />
+          <button 
+            onClick={() => {
+                if (loginInput.trim()) setToken(loginInput.trim());
+            }}
+            disabled={!loginInput.trim()}
+            className="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl active:scale-95 transition-all disabled:bg-gray-300 shadow-md shadow-blue-200"
+          >
+            ต่อไป
+          </button>
+        </div>
+      </div>
+    );
+  }
   const [stats, setStats] = useState<Stats>({ total: 0, completed: 0, processing: 0, failed: 0 })
   const [postHistory, setPostHistory] = useState<PostHistory[]>([])
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
@@ -908,12 +957,12 @@ function App() {
   async function loadData() {
     try {
       try {
-        const statsResp = await fetch(`${WORKER_URL}/api/stats`)
+        const statsResp = await apiFetch(`${WORKER_URL}/api/stats`)
         if (statsResp.ok) setStats(await statsResp.json())
       } catch { }
 
       try {
-        const histResp = await fetch(`${WORKER_URL}/api/post-history`)
+        const histResp = await apiFetch(`${WORKER_URL}/api/post-history`)
         if (histResp.ok) {
           const data = await histResp.json()
           setPostHistory(data.history || [])
@@ -921,7 +970,7 @@ function App() {
       } catch { }
 
       try {
-        const galleryResp = await fetch(`${WORKER_URL}/api/gallery`)
+        const galleryResp = await apiFetch(`${WORKER_URL}/api/gallery`)
         if (galleryResp.ok) {
           const data = await galleryResp.json()
           setVideos(data.videos || [])
@@ -929,7 +978,7 @@ function App() {
       } catch { }
 
       try {
-        const usedResp = await fetch(`${WORKER_URL}/api/gallery/used`)
+        const usedResp = await apiFetch(`${WORKER_URL}/api/gallery/used`)
         if (usedResp.ok) {
           const data = await usedResp.json()
           setUsedVideos(data.videos || [])
@@ -938,8 +987,8 @@ function App() {
 
       try {
         const [procResp, queueResp] = await Promise.all([
-          fetch(`${WORKER_URL}/api/processing`),
-          fetch(`${WORKER_URL}/api/queue`),
+          apiFetch(`${WORKER_URL}/api/processing`),
+          apiFetch(`${WORKER_URL}/api/queue`),
         ])
         const procData = procResp.ok ? await procResp.json() : { videos: [] }
         const queueData = queueResp.ok ? await queueResp.json() : { queue: [] }
@@ -955,7 +1004,7 @@ function App() {
   async function loadPages() {
     setPagesLoading(true)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/pages`)
+      const resp = await apiFetch(`${WORKER_URL}/api/pages`)
       if (resp.ok) {
         const data = await resp.json()
         setPages(data.pages || [])
@@ -969,7 +1018,7 @@ function App() {
 
   async function loadCategories() {
     try {
-      const resp = await fetch(`${WORKER_URL}/api/categories`)
+      const resp = await apiFetch(`${WORKER_URL}/api/categories`)
       if (resp.ok) {
         const data = await resp.json()
         setCategories(data.categories || [])
@@ -979,7 +1028,7 @@ function App() {
 
   async function saveCategories(cats: string[]) {
     setCategories(cats)
-    await fetch(`${WORKER_URL}/api/categories`, {
+    await apiFetch(`${WORKER_URL}/api/categories`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ categories: cats })
@@ -999,7 +1048,7 @@ function App() {
   const handleDeletePage = async (pageId: string) => {
     setDeletingPageId(pageId)
     try {
-      const resp = await fetch(`${WORKER_URL}/api/pages/${pageId}`, { method: 'DELETE' })
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/${pageId}`, { method: 'DELETE' })
       if (resp.ok) {
         setPages(pages.filter(p => p.id !== pageId))
       }
@@ -1014,7 +1063,7 @@ function App() {
   const handleCancelJob = async (id: string, isQueued: boolean) => {
     try {
       const endpoint = isQueued ? 'queue' : 'processing'
-      await fetch(`${WORKER_URL}/api/${endpoint}/${id}`, { method: 'DELETE' })
+      await apiFetch(`${WORKER_URL}/api/${endpoint}/${id}`, { method: 'DELETE' })
       setProcessingVideos(prev => prev.filter(v => v.id !== id))
     } catch { }
   }
@@ -1307,7 +1356,7 @@ function App() {
                             onClick={async () => {
                               setDeletingLogId(item.id)
                               try {
-                                await fetch(`${WORKER_URL}/api/post-history/${item.id}`, { method: 'DELETE' })
+                                await apiFetch(`${WORKER_URL}/api/post-history/${item.id}`, { method: 'DELETE' })
                                 setPostHistory(prev => prev.filter(h => h.id !== item.id))
                               } finally {
                                 setDeletingLogId(null)
@@ -1480,7 +1529,19 @@ function App() {
             </div>
 
             <div className="flex justify-center pt-8">
-              <p className="text-gray-300 text-xs font-medium">Version 2.0.1 (Build 240)</p>
+              
+            {/* Logout Bot */}
+            <div className="pt-2">
+              <button 
+                 onClick={() => setToken('')}
+                 className="w-full bg-red-50 text-red-600 border border-red-100 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 active:scale-95 transition-transform"
+              >
+                  <span>Switch Bot</span>
+                  <span className="text-[10px] text-red-400 font-mono font-normal">Token: {token.slice(0,10)}...</span>
+              </button>
+            </div>
+
+<p className="text-gray-300 text-xs font-medium">Version 2.0.1 (Build 240)</p>
             </div>
           </div>
         )}

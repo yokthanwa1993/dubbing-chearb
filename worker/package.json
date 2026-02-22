@@ -11,7 +11,7 @@
     },
     "dependencies": {
         "@cloudflare/containers": "^0.1.0",
-        "hono": "^4.0.0"
+        "hono": "^4.12.1"
     },
     "devDependencies": {
         "@cloudflare/workers-types": "^4.20240117.0",

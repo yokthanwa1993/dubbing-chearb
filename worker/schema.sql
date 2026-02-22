@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS pages (
     access_token TEXT NOT NULL,
     comment_token TEXT,
     post_interval_minutes INTEGER DEFAULT 60,
+    bot_id TEXT DEFAULT 'default',
     post_hours TEXT DEFAULT '',
     is_active INTEGER DEFAULT 1,
     last_post_at TEXT,
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS post_queue (
     video_id TEXT NOT NULL,
     page_id TEXT NOT NULL,
     scheduled_at TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, processing, completed, failed
+    status TEXT DEFAULT 'pending',
+    bot_id TEXT DEFAULT 'default', -- pending, processing, completed, failed
     error_message TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
@@ -36,7 +38,8 @@ CREATE TABLE IF NOT EXISTS post_history (
     fb_post_id TEXT,
     fb_reel_url TEXT,
     posted_at TEXT DEFAULT (datetime('now')),
-    status TEXT DEFAULT 'success', -- success, failed
+    status TEXT DEFAULT 'success',
+    bot_id TEXT DEFAULT 'default', -- success, failed
     error_message TEXT,
     FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
 );
@@ -58,3 +61,11 @@ CREATE INDEX IF NOT EXISTS idx_pages_active ON pages(is_active);
 -- Initial Settings
 INSERT OR IGNORE INTO settings (key, value) VALUES ('default_interval', '60');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('max_posts_per_day', '48');
+
+
+-- Create table for allowed Telegram Users
+CREATE TABLE IF NOT EXISTS allowed_users (
+    telegram_id INTEGER PRIMARY KEY,
+    name TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
