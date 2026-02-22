@@ -89,135 +89,163 @@ app.post('/api/telegram/:token?', async (c) => {
     const msg = data.message
     const cb = data.callback_query
     const chatId = msg?.chat?.id || cb?.message?.chat?.id
-    const token = c.req.param('token') || c.req.header('x-auth-token') || (c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN)
+    const token = c.req.param('token') || c.req.header('x-auth-token') || c.env.TELEGRAM_BOT_TOKEN
     const botId = c.get('botId') || 'default'
 
-    // Verify User Access
-    if (chatId) {
+    if (!chatId) return c.text('ok')
+
+    // Check if this token belongs to a registered Channel Bot
+    const isChannelBot = await c.env.DB.prepare('SELECT 1 FROM channels WHERE bot_token = ?').bind(token).first()
+
+    // ==================== SETTING BOT (ไม่ใช่ Channel Bot) ====================
+    if (!isChannelBot) {
+        // Verify allowed user
         const allowedUser = await c.env.DB.prepare('SELECT 1 FROM allowed_users WHERE telegram_id = ?').bind(chatId).first()
-        if (!allowedUser) {
-            console.log('Unauthorized Telegram ID:', chatId)
+        if (!allowedUser) return c.text('ok')
+
+        const stateKey = `_setting_state/${chatId}.json`
+        const workerUrl = new URL(c.req.url).origin
+
+        // Setting Bot: Callback Queries
+        if (cb) {
+            const action = cb.data as string
+            if (action.startsWith('del_channel:')) {
+                const delBotId = action.replace('del_channel:', '')
+                await c.env.DB.prepare('DELETE FROM channels WHERE bot_id = ? AND owner_telegram_id = ?').bind(delBotId, chatId).run()
+                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `🗑 ลบช่องเรียบร้อยแล้ว` })
+            }
+            await sendTelegram(token, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => null)
             return c.text('ok')
         }
-    } else {
+
+        if (!msg) return c.text('ok')
+        const text = msg.text || ''
+
+        // /start
+        if (text === '/start' || text === '/menu') {
+            await c.env.BUCKET.delete(stateKey).catch(() => { })
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: '⚙️ *Dubbing Chearb — ตั้งค่าช่อง*\n\n📋 *คำสั่ง*\n🔹 /newchannel — เพิ่มช่องใหม่ (ส่ง Bot Token)\n🔹 /channels — ดูช่องทั้งหมดของคุณ\n\n1 ช่อง = 1 บอท Telegram\nแต่ละช่องมีแดชบอร์ดและเพจแยกกัน',
+                parse_mode: 'Markdown'
+            })
+            return c.text('ok')
+        }
+
+        // /newchannel
+        if (text === '/newchannel') {
+            await c.env.BUCKET.put(stateKey, JSON.stringify({ state: 'WAITING_BOT_TOKEN' }), { httpMetadata: { contentType: 'application/json' } })
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: '🤖 *เพิ่มช่องใหม่*\n\nกรุณาส่ง *Bot Token* ที่ได้จาก @BotFather มาเลยครับ\n\nตัวอย่าง:\n`8328894625:AAEgMQwFeBkTLTYP-s5feVUsc7B64jTInAs`',
+                parse_mode: 'Markdown'
+            })
+            return c.text('ok')
+        }
+
+        // /channels
+        if (text === '/channels') {
+            await c.env.BUCKET.delete(stateKey).catch(() => { })
+            const { results: channels } = await c.env.DB.prepare(
+                'SELECT bot_id, bot_username, name, created_at FROM channels WHERE owner_telegram_id = ? ORDER BY created_at DESC'
+            ).bind(chatId).all() as any
+
+            if (channels.length === 0) {
+                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '📭 ยังไม่มีช่องที่ลงทะเบียนไว้\n\nใช้ /newchannel เพื่อเพิ่มช่องใหม่' })
+                return c.text('ok')
+            }
+
+            let channelText = '📋 *ช่องทั้งหมดของคุณ*\n\n'
+            const buttons: any[][] = []
+            for (const ch of channels) {
+                const pageCount = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM pages WHERE bot_id = ?').bind(ch.bot_id).first() as any
+                channelText += `🤖 *${ch.name || 'ไม่มีชื่อ'}*\n`
+                channelText += `├ @${ch.bot_username || '—'}\n`
+                channelText += `├ เพจ: ${pageCount?.cnt || 0} เพจ\n`
+                channelText += `└ ID: \`${ch.bot_id}\`\n\n`
+                buttons.push([{ text: `🗑 ลบ ${ch.name || ch.bot_username}`, callback_data: `del_channel:${ch.bot_id}` }])
+            }
+
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: channelText,
+                parse_mode: 'Markdown',
+                reply_markup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined
+            })
+            return c.text('ok')
+        }
+
+        // Handle state: waiting for bot token
+        const stateObj = await c.env.BUCKET.get(stateKey)
+        if (stateObj) {
+            const state = await stateObj.json() as any
+
+            if (state.state === 'WAITING_BOT_TOKEN' && text && !text.startsWith('/')) {
+                await c.env.BUCKET.delete(stateKey)
+                const botToken = text.trim()
+
+                // Validate token via Telegram getMe
+                const getMeResp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`)
+                if (!getMeResp.ok) {
+                    await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ Bot Token ไม่ถูกต้อง กรุณาตรวจสอบแล้วลองใหม่\n\nใช้ /newchannel เพื่อลองอีกครั้ง' })
+                    return c.text('ok')
+                }
+                const getMeData = await getMeResp.json() as any
+                const botInfo = getMeData.result
+                const newBotId = getBotId(botToken)
+
+                // Check if already registered
+                const existing = await c.env.DB.prepare('SELECT 1 FROM channels WHERE bot_id = ?').bind(newBotId).first()
+                if (existing) {
+                    await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `⚠️ ช่อง @${botInfo.username} ลงทะเบียนไว้แล้ว` })
+                    return c.text('ok')
+                }
+
+                // Register channel
+                await c.env.DB.prepare(
+                    'INSERT INTO channels (bot_id, bot_token, bot_username, owner_telegram_id, name) VALUES (?, ?, ?, ?, ?)'
+                ).bind(newBotId, botToken, botInfo.username || '', chatId, botInfo.first_name || '').run()
+
+                // Add owner to allowed_users if not already
+                await c.env.DB.prepare(
+                    'INSERT INTO allowed_users (telegram_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING'
+                ).bind(chatId, botInfo.first_name || 'owner').run()
+
+                // Set webhook for the new channel bot
+                const webhookUrl = `${workerUrl}/api/telegram/${botToken}`
+                await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: webhookUrl })
+                })
+
+                await sendTelegram(token, 'sendMessage', {
+                    chat_id: chatId,
+                    text: `✅ *ลงทะเบียนช่องสำเร็จ!*\n\n🤖 ชื่อ: *${botInfo.first_name}*\n👤 @${botInfo.username}\n🔗 Webhook: ตั้งค่าแล้ว\n\nตอนนี้ไปที่ @${botInfo.username} แล้วส่งวิดีโอได้เลย!\nจัดการเพจ Facebook ผ่าน WebApp ของช่องนั้น`,
+                    parse_mode: 'Markdown'
+                })
+                return c.text('ok')
+            }
+        }
+
+        // Unknown message for Setting Bot
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: '❓ ไม่เข้าใจคำสั่ง\n\nใช้ /start เพื่อดูเมนู'
+        })
         return c.text('ok')
     }
 
-    // Process Callback Query First
-    if (cb) {
-        const action = cb.data as string
-        if (action.startsWith('add_page:')) {
-            const targetId = action.split(':')[1]
-            const tempObj = await c.get('bucket').get(`_fb_temp/${chatId}.json`)
-            if (tempObj) {
-                const pagesList = await tempObj.json() as any[]
-                const targetPage = pagesList.find(p => p.id === targetId)
-                if (targetPage) {
-                    const imageUrl = targetPage.picture?.data?.url || ''
-                    await c.env.DB.prepare(
-                        'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?) ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, name = excluded.name, image_url = excluded.image_url, bot_id = excluded.bot_id'
-                    ).bind(targetPage.id, targetPage.name, imageUrl, targetPage.access_token, botId).run()
-                    await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `✅ *เชื่อมต่อเพจเสร็จสมบูรณ์!*\nเพจ: ${targetPage.name}\n\nระบบจะทำการโพสต์ไปยังเพจนี้ตามคิวที่ตั้งไว้`, parse_mode: 'Markdown' })
-                }
-            }
-            await sendTelegram(token, 'answerCallbackQuery', { callback_query_id: cb.id, text: "เพิ่มข้อมูลสำเร็จ!" }).catch(() => null)
-        }
+    // ==================== CHANNEL BOT (ช่องที่ลงทะเบียนแล้ว) ====================
+    // Verify allowed user
+    const allowedUser = await c.env.DB.prepare('SELECT 1 FROM allowed_users WHERE telegram_id = ?').bind(chatId).first()
+    if (!allowedUser) {
+        console.log('Unauthorized Telegram ID:', chatId)
         return c.text('ok')
     }
 
     if (!msg) return c.text('ok')
     const text = msg.text || ''
-
-    // Telegram UI Configuration Commands (Bot UI)
-    const stateKey = `_user_state/${chatId}.json`
-
-    if (text === '/start' || text === '/menu') {
-        await c.get('bucket').delete(stateKey)
-        await sendTelegram(token, 'sendMessage', {
-            chat_id: chatId,
-            text: '👋 *ระบบโพสต์อัตโนมัติ Dubbing Chearb*\n\n⚙️ *เมนูลัด*\n🔹 /newchannel - เชื่อมต่อเพจ Facebook เข้าบอท\n🔹 /channels - ดูรายการเพจทั้งหมดและจัดการ\n🔹 /status - ดูสถานะการทำงานบอท\n\nสามารถส่งลิงก์วิดีโอเข้าคิวได้เลย!',
-            parse_mode: 'Markdown'
-        })
-        return c.text('ok')
-    }
-
-    if (text === '/newchannel') {
-        await c.get('bucket').put(stateKey, JSON.stringify({ state: 'WAITING_FB_TOKEN' }), { httpMetadata: { contentType: 'application/json' } })
-        await sendTelegram(token, 'sendMessage', {
-            chat_id: chatId,
-            text: '📥 *เพิ่มช่อง Facebook*\n\nกรุณาส่ง *User Access Token* ของ Facebook (ที่ได้จาก Meta for Developers) มาในข้อความถัดไปได้เลยครับผม',
-            parse_mode: 'Markdown'
-        })
-        return c.text('ok')
-    }
-
-    if (text === '/channels') {
-        await c.get('bucket').delete(stateKey)
-        const { results: pages } = await c.env.DB.prepare('SELECT id, name FROM pages WHERE bot_id = ?').bind(botId).all() as any
-        if (pages.length === 0) {
-            await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ ขณะนี้ยังไม่มีช่องใดถูกผูกกับบอทตัวนี้ครับ' })
-            return c.text('ok')
-        }
-        const pageText = pages.map((p: any, i: number) => `${i + 1}. ${p.name}\n(ID: ${p.id})`).join('\n\n')
-        await sendTelegram(token, 'sendMessage', {
-            chat_id: chatId,
-            text: `📄 *ช่องทั้งหมดของคุณ*\n\n${pageText}\n\nพิมพ์ /delchannel <ID> เพื่อลบช่องครับ`,
-            parse_mode: 'Markdown'
-        })
-        return c.text('ok')
-    }
-
-    if (text.startsWith('/delchannel ')) {
-        const delId = text.split(' ')[1]
-        if (delId) {
-            await c.env.DB.prepare('DELETE FROM pages WHERE id = ? AND bot_id = ?').bind(delId, botId).run()
-            await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `🗑 ลบช่อง ID ${delId} เรียบร้อยแล้ว` })
-        }
-        return c.text('ok')
-    }
-
-    if (text === '/status') {
-        const { results: pages } = await c.env.DB.prepare('SELECT id FROM pages WHERE bot_id = ?').bind(botId).all() as any
-        const { results: queued } = await c.env.DB.prepare("SELECT video_id FROM post_queue WHERE status = 'queued' AND bot_id = ?").bind(botId).all() as any
-        await sendTelegram(token, 'sendMessage', {
-            chat_id: chatId,
-            text: `📊 *สถานะบอทของคุณ*\n\n🔗 จำนวนเพจ: ${pages.length}\n⏳ คิวเตรียมโพสต์: ${queued.length}\n\n[แดชบอร์ด WebApp](${c.env.R2_PUBLIC_URL})`,
-            parse_mode: 'Markdown'
-        })
-        return c.text('ok')
-    }
-
-    const stateObj = await c.get('bucket').get(stateKey)
-    if (stateObj) {
-        const state = await stateObj.json() as any
-        if (state.state === 'WAITING_FB_TOKEN' && text && !text.startsWith('/')) {
-            await c.get('bucket').delete(stateKey)
-            const fbToken = text.trim()
-
-            const fbResponse = await fetch(`https://graph.facebook.com/v21.0/me/accounts?fields=id,name,picture.type(large),access_token&access_token=${fbToken}`)
-            if (!fbResponse.ok) {
-                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ Token ไม่ถูกต้องหรือไม่สามารถดึงข้อมูลเพจได้' })
-                return c.text('ok')
-            }
-            const fbData = await fbResponse.json() as any
-            const pagesList = fbData.data || []
-            if (pagesList.length === 0) {
-                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: '❌ ไม่พบหน้าเพจที่จัดการได้ในบัญชีนี้' })
-                return c.text('ok')
-            }
-
-            await c.get('bucket').put(`_fb_temp/${chatId}.json`, JSON.stringify(pagesList), { httpMetadata: { contentType: 'application/json' } })
-            const buttons = pagesList.map((p: any) => ([{ text: `➕ ${p.name}`, callback_data: `add_page:${p.id}` }]))
-
-            await sendTelegram(token, 'sendMessage', {
-                chat_id: chatId,
-                text: '✅ *พบเพจเหล่านี้:* เลือกเพจที่ต้องการซิงค์เข้าบอท 👇',
-                parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: buttons }
-            })
-            return c.text('ok')
-        }
-    }
     // ORIGINAL WEBHOOK CONTINUES HERE
     // `data` has already been defined, so we just wrap it with try-catch fallback or assign to old variables.
     // The previous code had:
