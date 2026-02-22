@@ -116,7 +116,49 @@ app.post('/api/telegram/:token?', async (c) => {
             if (action.startsWith('del_channel:')) {
                 const delBotId = action.replace('del_channel:', '')
                 await c.env.DB.prepare('DELETE FROM channels WHERE bot_id = ? AND owner_telegram_id = ?').bind(delBotId, chatId).run()
-                await sendTelegram(token, 'sendMessage', { chat_id: chatId, text: `🗑 ลบช่องเรียบร้อยแล้ว` })
+                await sendTelegram(token, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text: `🗑 ลบช่องเรียบร้อยแล้ว` })
+            } else if (action.startsWith('view_bot:')) {
+                const viewBotId = action.replace('view_bot:', '')
+                const ch = await c.env.DB.prepare('SELECT bot_id, bot_username, name FROM channels WHERE bot_id = ? AND owner_telegram_id = ?').bind(viewBotId, chatId).first() as any
+                if (ch) {
+                    const pageCount = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM pages WHERE bot_id = ?').bind(ch.bot_id).first() as any
+                    let text = `🤖 *${ch.name || 'ไม่มีชื่อ'}*\n`
+                    text += `├ @${ch.bot_username || '—'}\n`
+                    text += `├ เพจ: ${pageCount?.cnt || 0} เพจ\n`
+                    text += `└ ID: \`${ch.bot_id}\`\n\n`
+                    text += `เลือกดำเนินการกับบอทตัวนี้:`
+
+                    const buttons = [
+                        [{ text: `🗑 ลบ ${ch.name || ch.bot_username}`, callback_data: `del_channel:${ch.bot_id}` }],
+                        [{ text: `🔙 กลับรายการช่องทั้งหมด`, callback_data: `back_to_list` }]
+                    ]
+                    await sendTelegram(token, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } })
+                }
+            } else if (action === 'back_to_list') {
+                const { results: channels } = await c.env.DB.prepare(
+                    'SELECT bot_id, bot_username, name FROM channels WHERE owner_telegram_id = ? ORDER BY created_at DESC'
+                ).bind(chatId).all() as any
+
+                if (channels.length === 0) {
+                    await sendTelegram(token, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text: '📭 ยังไม่มีช่องที่ลงทะเบียนไว้\n\nใช้ /newchannel เพื่อเพิ่มช่องใหม่' })
+                } else {
+                    const buttons: any[][] = []
+                    let row: any[] = []
+                    for (const ch of channels) {
+                        row.push({ text: `@${ch.bot_username}`, callback_data: `view_bot:${ch.bot_id}` })
+                        if (row.length === 2) {
+                            buttons.push(row)
+                            row = []
+                        }
+                    }
+                    if (row.length > 0) buttons.push(row)
+                    await sendTelegram(token, 'editMessageText', {
+                        chat_id: chatId,
+                        message_id: cb.message.message_id,
+                        text: 'Choose a bot from the list below:',
+                        reply_markup: { inline_keyboard: buttons }
+                    })
+                }
             }
             await sendTelegram(token, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => null)
             return c.text('ok')
@@ -160,7 +202,7 @@ app.post('/api/telegram/:token?', async (c) => {
         if (text === '/mychannel') {
             await c.env.BUCKET.delete(stateKey).catch(() => { })
             const { results: channels } = await c.env.DB.prepare(
-                'SELECT bot_id, bot_username, name, created_at FROM channels WHERE owner_telegram_id = ? ORDER BY created_at DESC'
+                'SELECT bot_id, bot_username, name FROM channels WHERE owner_telegram_id = ? ORDER BY created_at DESC'
             ).bind(chatId).all() as any
 
             if (channels.length === 0) {
@@ -168,22 +210,21 @@ app.post('/api/telegram/:token?', async (c) => {
                 return c.text('ok')
             }
 
-            let channelText = '📋 *ช่องทั้งหมดของคุณ*\n\n'
             const buttons: any[][] = []
+            let row: any[] = []
             for (const ch of channels) {
-                const pageCount = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM pages WHERE bot_id = ?').bind(ch.bot_id).first() as any
-                channelText += `🤖 *${ch.name || 'ไม่มีชื่อ'}*\n`
-                channelText += `├ @${ch.bot_username || '—'}\n`
-                channelText += `├ เพจ: ${pageCount?.cnt || 0} เพจ\n`
-                channelText += `└ ID: \`${ch.bot_id}\`\n\n`
-                buttons.push([{ text: `🗑 ลบ ${ch.name || ch.bot_username}`, callback_data: `del_channel:${ch.bot_id}` }])
+                row.push({ text: `@${ch.bot_username}`, callback_data: `view_bot:${ch.bot_id}` })
+                if (row.length === 2) {
+                    buttons.push(row)
+                    row = []
+                }
             }
+            if (row.length > 0) buttons.push(row)
 
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: channelText,
-                parse_mode: 'Markdown',
-                reply_markup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined
+                text: 'Choose a bot from the list below:',
+                reply_markup: { inline_keyboard: buttons }
             })
             return c.text('ok')
         }
